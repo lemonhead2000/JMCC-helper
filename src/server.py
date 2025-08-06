@@ -80,10 +80,10 @@ def uri_to_path(uri):
         parsed = urlparse(uri)
         if parsed.scheme != "file":
             return None
-        path = unquote(parsed.path)  # %3A → :
+        path = unquote(parsed.path)
         if os.name == "nt":
             if path.startswith("/"):
-                path = path[1:]  # Убираем первый /
+                path = path[1:]
             path = path.replace("/", "\\")
         return path
     except Exception as e:
@@ -95,7 +95,6 @@ def path_to_uri(path):
         path = path.replace("\\", "/")
     return f"file:///{path}"
 
-# --- Чтение файла по URI ---
 def read_document(uri):
     path = uri_to_path(uri)
     if not path or not os.path.exists(path):
@@ -107,7 +106,6 @@ def read_document(uri):
         log(f"Failed to read {path}: {e}")
         return None
 
-# --- Извлечение слова под курсором ---
 def get_word_at_position(lines, line_num, char):
     if line_num >= len(lines):
         return None, -1, -1
@@ -125,7 +123,6 @@ def get_word_at_position(lines, line_num, char):
     word = line[start:end]
     return word, start, end
 
-# === Основной цикл ===
 def main():
     log("Server starting")
 
@@ -182,11 +179,57 @@ def main():
                 jmcc_extension.tokenize(content, uri, True)
 
             elif method == "textDocument/completion":
+                uri = msg["params"]["textDocument"]["uri"]
+                pos = msg["params"]["position"]
+                line_num = pos["line"]
+                char = pos["character"]
+
+                if uri not in documents:
+                    send_message({"id": rpc_id, "result": None})
+                    continue
+
+                lines = documents[uri].splitlines()
+                if line_num >= len(lines):
+                    send_message({"id": rpc_id, "result": None})
+                    continue
+
+                line = lines[line_num]
+                text_before = line[:char]
+                match = re.search(r"[\w:]*$", text_before)
+                if not match:
+                    prefix = ""
+                else:
+                    prefix = match.group(0)
+                prefix = prefix.strip()
+
+                filtered_items = []
+                for item in completions_db:
+                    label = item.get("label", "")
+                    if prefix and not label.startswith(prefix):
+                        continue
+                    start_char = char - len(prefix)
+                    if start_char < 0:
+                        start_char = 0
+                    text_edit = {
+                        "range": {
+                            "start": {"line": line_num, "character": start_char},
+                            "end": {"line": line_num, "character": char}
+                        },
+                        "newText": label 
+                    }
+
+                    new_item = {**item}
+                    if "insertText" in new_item:
+                        del new_item["insertText"]
+                    new_item["textEdit"] = text_edit
+
+                    filtered_items.append(new_item)
+
                 send_message({
                     "id": rpc_id,
                     "result": {
                         "isIncomplete": False,
-                        "items": completions_db
+                        "items": filtered_items
                     }
                 })
 
@@ -214,8 +257,7 @@ def main():
                     continue
 
                 log(f"Hover word detected: '{word}'")
-
-                # 1. Сначала смотри в JSON
+                
                 if word in hover_db:
                     log(f"Hover found in JSON for '{word}'")
                     send_message({
@@ -232,17 +274,8 @@ def main():
                         }
                     })
                 else:
-                    # 2. Если нет — ищи в коде (умный hover)
-                    hover_data = get_hover_from_definition(uri, word)
-                    if hover_data:
-                        log(f"Smart hover generated for '{word}'")
-                        send_message({
-                            "id": rpc_id,
-                            "result": hover_data
-                        })
-                    else:
-                        log(f"No hover found for '{word}'")
-                        send_message({"id": rpc_id, "result": None})
+                    log(f"No hover found for '{word}' in hover.json")
+                    send_message({"id": rpc_id, "result": None})
 
             elif method == "textDocument/definition":
                 uri = msg["params"]["textDocument"]["uri"]
@@ -261,13 +294,11 @@ def main():
                     send_message({"id": rpc_id, "result": None})
                     continue
 
-                # Сначала ищем в текущем файле
                 result = find_definition_in_file(uri, word)
                 if result:
                     send_message({"id": rpc_id, "result": result})
                     continue
 
-                # Если не нашли — ищем в импортированных файлах
                 imports = extract_imports(uri, documents[uri])
                 for import_path in imports:
                     imported_uri = resolve_import_uri(uri, import_path)
@@ -298,7 +329,6 @@ def main():
                 line = lines[line_num]
                 char = pos["character"]
 
-                # Ищем позицию `(`, двигаясь назад
                 bracket_pos = -1
                 paren_count = 0
                 for i in range(char - 1, -1, -1):
@@ -319,7 +349,6 @@ def main():
                     send_message({"id": rpc_id, "result": None})
                     continue
 
-                # Извлекаем имя функции перед `(`
                 func_start = bracket_pos - 1
                 while func_start > 0 and (line[func_start - 1].isalnum() or line[func_start - 1] in "_"):
                     func_start -= 1
@@ -331,28 +360,25 @@ def main():
 
                 log(f"Resolving signature for: '{func_name}'")
 
-                # 🔹 Шаг 1: Проверяем JSON (signatures.json)
                 signatures = load_signatures()
                 sig_data = signatures.get(func_name)
 
                 if sig_data:
-                    log(f"✅ Signature found in JSON for '{func_name}'")
+                    log(f"Signature found in JSON for '{func_name}'")
                 else:
-                    # 🔹 Шаг 2: Если нет в JSON — ищем в коде
+
                     log(f"🔍 Signature not in JSON, searching in code...")
                     sig_data = get_signature_from_definition(uri, func_name)
                     if sig_data:
-                        log(f"✅ Signature generated from code: {sig_data['label']}")
+                        log(f"Signature generated from code: {sig_data['label']}")
                     else:
-                        log(f"❌ No signature found for '{func_name}' in JSON or code")
+                        log(f"No signature found for '{func_name}' in JSON or code")
                         send_message({"id": rpc_id, "result": None})
                         continue
 
-                # Определим активный параметр
                 inner = line[bracket_pos + 1:char]
                 arg_idx = inner.count(",")
 
-                # Форматируем параметры
                 params = []
                 if isinstance(sig_data.get("params"), list):
                     params = [{"label": p} for p in sig_data["params"]]
@@ -380,53 +406,74 @@ def main():
                 if uri not in documents:
                     send_message({"id": rpc_id, "result": []})
                     continue
-
                 lines = documents[uri].splitlines()
                 hints = []
+                definition_lines = set()
+                for line_num, line in enumerate(lines):
+                    stripped = line.strip()
+                    if re.match(r"\b(?:function|process|inline\s+function)\b", stripped):
+                        definition_lines.add(line_num)
 
                 for line_num, line in enumerate(lines):
-                    # ✅ Правильный regex: \b, \w — без экранирования
+                    if line_num in definition_lines:
+                        continue
                     for match in re.finditer(r"\b(\w+)\s*\(([^)]*)\)", line):
                         func_name = match.group(1)
                         args_content = match.group(2)
-
-                        # Разбиваем аргументы
                         if not args_content.strip():
-                            args = []
-                        else:
-                            args = [a.strip() for a in args_content.split(",") if a.strip()]
-
-                        if len(args) == 0:
                             continue
-
-                        # 🔍 Ищем сигнатуру
+                        args = []
+                        arg_positions = []
+                        paren_start = match.start(2)
+                        content = args_content
+                        arg_start_rel = 0
+                        i = 0
+                        while i < len(content):
+                            if content[i] in " \t":
+                                i += 1
+                                continue
+                            start = i
+                            while i < len(content) and content[i] not in ",)":
+                                i += 1
+                            raw_arg = content[start:i].strip()
+                            if raw_arg:
+                                arg_start_abs = paren_start + start
+                                arg_end_abs = paren_start + i
+                                args.append(raw_arg)
+                                arg_positions.append((arg_start_abs, arg_end_abs, raw_arg))
+                            if i < len(content) and content[i] == ",":
+                                i += 1
+                            else:
+                                break
                         sig = get_signature_from_definition(uri, func_name)
-                        if not sig or not sig.get("params"):
+                        if not sig or not isinstance(sig.get("params"), list):
                             continue
 
                         params = sig["params"]
-                        start_pos = match.start(1) + len(func_name) + 1
-
-                        for i, arg in enumerate(args):
-                            if i >= len(params):
-                                break
-                            arg_start = find_argument_position(line, arg, start_pos)
-                            if arg_start == -1:
+                        for idx, (start_abs, end_abs, raw_arg) in enumerate(arg_positions):
+                            if "=" in raw_arg and raw_arg.split("=")[0].strip().isidentifier():
+                                continue
+                            if idx >= len(params):
+                                continue
+                            param_name = params[idx]
+                            if not param_name:
+                                continue
+                            char_pos = find_argument_position(line, raw_arg, match.start(1))
+                            if char_pos == -1:
                                 continue
 
                             hints.append({
                                 "position": {
                                     "line": line_num,
-                                    "character": arg_start
+                                    "character": char_pos
                                 },
-                                "label": f"{params[i]}: ",
+                                "label": f"{param_name}:",
                                 "kind": 1,
                                 "paddingLeft": False,
                                 "paddingRight": True
                             })
-                            start_pos = arg_start + len(arg)
 
-                log(f"✅ Inlay hints sent: {len(hints)}")
+                log(f"Inlay hints sent: {len(hints)}")
                 send_message({
                     "id": rpc_id,
                     "result": hints
@@ -489,7 +536,6 @@ def find_definition_in_file(uri, word):
 
     lines = content.splitlines()
 
-    # Регулярка для определений
     pattern = re.compile(
         rf"\b(?:def|class|function|process|var)\b.*?\b{re.escape(word)}\b|"
         rf"class\s+{re.escape(word)}\s*{{"
@@ -536,12 +582,8 @@ def parse_function_signature(line):
         function get_length(self: vector2d)
     """
     line = line.split("//")[0].strip()
-
-    # Удаляем inline, если есть
     is_inline = "inline" in line
     clean_line = re.sub(r"\binline\b", "", line).strip()
-
-    # Ищем: [function|process] name(params) [-> return]
     match = re.search(
         r"\b(?:function|process)\b\s+(\w+)\s*\(\s*([^)]*)\s*\)\s*(?:->\s*(\w+))?",
         clean_line,
@@ -553,20 +595,15 @@ def parse_function_signature(line):
     func_name = match.group(1)
     params_str = match.group(2) or ""
     return_type = match.group(3)
-
-    # Извлекаем имена параметров (до `:` или `=`)
     if params_str.strip():
         raw_params = [p.strip() for p in params_str.split(",")]
         param_names = []
         for p in raw_params:
-            # Берём только имя до `:` или `=`
             param_name = re.split(r"[:=]", p)[0].strip()
             if param_name:
                 param_names.append(param_name)
     else:
         param_names = []
-
-    # Формируем label
     params_part = ", ".join(param_names)
     return_part = f" -> {return_type}" if return_type else ""
     label = f"{func_name}({params_part}){return_part}"
@@ -593,13 +630,11 @@ def get_signature_from_definition(start_uri, func_name):
             log(f"Failed to read {uri}")
             return None
 
-        # 1. Ищем в этом файле
         for line in content.splitlines():
             sig = parse_function_signature(line)
             if sig and sig["name"] == func_name:
                 return sig
 
-        # 2. Ищем в импортах
         imports = extract_imports(uri, content)
         for imp_path in imports:
             imported_uri = resolve_import_uri(uri, imp_path)
@@ -622,117 +657,5 @@ def find_argument_position(line, arg, start_pos):
         return start_pos + match.start()
     return -1
     
-def get_hover_from_definition(start_uri, word):
-    visited_uris = set()
-
-    def search(uri):
-        if uri in visited_uris:
-            return None
-        visited_uris.add(uri)
-
-        content = documents.get(uri) or read_document(uri)
-        if not content:
-            return None
-
-        lines = content.splitlines()
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            clean_line = line.split("//")[0].strip()
-
-            # Проверяем: class word {
-            class_match = re.match(rf"class\s+{re.escape(word)}\s*{{", clean_line)
-            if class_match:
-                # Это class
-                methods = []
-                j = i + 1
-                brace_level = 1  # учитываем вложенные блоки
-                while j < len(lines) and brace_level > 0:
-                    inner_line = lines[j]
-                    inner_clean = inner_line.split("//")[0].strip()
-
-                    if inner_clean.endswith("{"):
-                        brace_level += 1
-                    if inner_clean == "}":
-                        brace_level -= 1
-                        if brace_level == 0:
-                            break
-
-                    # Ищем function или inline function
-                    func_match = re.search(r"\b(?:inline\s+)?function\s+(\w+)", inner_clean)
-                    if func_match:
-                        method_name = func_match.group(1)
-                        sig = parse_function_signature(inner_line)
-                        if sig:
-                            methods.append(f"{sig['label']}")
-                        else:
-                            methods.append(f"{method_name}(...)")
-
-                    j += 1
-
-                # Формируем hover
-                value = f"**class** `{word}`\n\n"
-                value += f"```justcode\nclass {word} {{\n"
-                if methods:
-                    value += "// Methods\n" + "\n".join(methods) + "\n"
-                value += "}\n```"
-
-                return {
-                    "contents": {
-                        "kind": "markdown",
-                        "value": value
-                    },
-                    "range": {
-                        "start": {"line": i, "character": line.find(word)},
-                        "end": {"line": i, "character": line.find(word) + len(word)}
-                    }
-                }
-
-            # Проверяем обычные определения
-            if re.search(rf"\b(?:def|function|process|const|var)\b.*?\b{re.escape(word)}\b", clean_line):
-                sig = parse_function_signature(line) or {"name": word, "label": f"{word}(...)"}
-                doc_lines = []
-                prev_line = i - 1
-                while prev_line >= 0:
-                    prev = lines[prev_line].strip()
-                    if prev.startswith("//"):
-                        doc_lines.insert(0, prev[2:].strip())
-                    elif prev in ["", "{"]:
-                        prev_line -= 1
-                        continue
-                    else:
-                        break
-                    prev_line -= 1
-
-                value = f"**function** `{word}`\n\n```justcode\n{sig['label']}\n```"
-                if doc_lines:
-                    value += "\n\n" + "\n".join(doc_lines)
-
-                return {
-                    "contents": {
-                        "kind": "markdown",
-                        "value": value
-                    },
-                    "range": {
-                        "start": {"line": i, "character": line.find(word)},
-                        "end": {"line": i, "character": line.find(word) + len(word)}
-                    }
-                }
-
-            i += 1
-
-        # Поиск в импортах
-        imports = extract_imports(uri, content)
-        for imp_path in imports:
-            imported_uri = resolve_import_uri(uri, imp_path)
-            if imported_uri:
-                result = search(imported_uri)
-                if result:
-                    return result
-
-        return None
-
-    return search(start_uri)
-
 if __name__ == "__main__":
     main()

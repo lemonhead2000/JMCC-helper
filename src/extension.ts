@@ -34,8 +34,8 @@ function getClientOptions(): LanguageClientOptions {
         synchronize: {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.jc')
         },
-        outputChannel: outputChannel,  // ← явно передаём
-        outputChannelName: 'JMCC Language Server', // ← резервное имя
+        outputChannel: outputChannel,
+        outputChannelName: 'JMCC Language Server',
         initializationOptions: {
             capabilities: {
                 textDocument: {
