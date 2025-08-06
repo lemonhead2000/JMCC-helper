@@ -67,12 +67,18 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 
 ```json
 {
-  "compilerPath": "COMPILER_PATH", // Путь к JMCC
-  "defaultCompileActiveFileMode": "COMPILE_TYPE", // UPLOAD - загружает в облако; SAVE - сохраняет файл по пути <compilerOutputPath>; BOTH - UPLOAD + SAVE
-  "compilerOutputPath": "OUTPUT_FILE", // Путь, по которому будут сохраняться (де)компилированные файлы. Если не указан, то сохранится в папке вызова команды компиляции
-  "clearTerminalBeforeCommand": true // Будет ли очищаться консоль при каждом выполнении команды. Выполненные команды не будут очищаться
+  "compilerPath": "COMPILER_PATH",
+  "defaultCompileActiveFileMode": "COMPILE_TYPE",
+  "compilerOutputPath": "OUTPUT_FILE",
+  "clearTerminalBeforeCommand": true
 }
 ```
+| Поле | Описание |
+|------|---------|
+| `compilerPath` | Путь к исполняемому файлу JMCC |
+| `defaultCompileActiveFileMode` | Режим компиляции активного файла:<br><br>• `"UPLOAD"` — результат загружается в облако<br>• `"SAVE"` — файл сохраняется локально по пути из `compilerOutputPath`<br>• `"BOTH"` — выполняется и загрузка, и сохранение |
+| `compilerOutputPath` | Путь для сохранения скомпилированных или декомпилированных файлов. Если не указан, файл сохраняется в той же папке, где находится исходный файл. |
+| `clearTerminalBeforeCommand` | Если `true`, перед выполнением каждой команды консоль будет очищаться. |
 
 ## Разработка
 
