@@ -121,7 +121,7 @@
 "variables": {
   "patterns": [
     {
-      "begin": "(?<=[\\s\\[:.\\(]|^)(?:(save|game|inline|local)\\s+)?(?:var\\s+)?(?:(s|i|g|l))?\\s*(`)",
+      "begin": "(?<=[\\s\\[:.\\({,]|^)(?:(save|game|inline|local)\\s+)?(?:var\\s+)?(?:(s|i|g|l))?\\s*(`)",
       "beginCaptures": {
         "1": { "name": "keyword.control.storage.modifier.jc" },
         "2": { "name": "storage.type.type.prefix.jc" },

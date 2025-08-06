@@ -20,6 +20,15 @@
   ],
   
   "main": "./out/extension.js",
+  "activationEvents": [
+  "onLanguage:justcode",
+  "onCommand:jmcc.compileAsUrl",
+  "onCommand:jmcc.compileAsFile",
+  "onCommand:jmcc.decompileFile",
+  "onCommand:jmcc.compileActiveFile",
+  "onCommand:jmcc.runActiveFile",
+  "onCommand:jmcc.saveAndUpload"
+  ],
   "contributes": {
     "configurationDefaults": {
       "editor.tokenColorCustomizations": {
