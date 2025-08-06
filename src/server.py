@@ -167,16 +167,16 @@ def main():
             elif method == "textDocument/didOpen":
                 uri = msg["params"]["textDocument"]["uri"]
                 text = msg["params"]["textDocument"]["text"]
-                documents[uri] = text
+                documents[uri] = text.replace("\r","")
                 jmcc_extension.clear(uri)
-                jmcc_extension.tokenize(text, uri, True)
+                jmcc_extension.tokenize(documents[uri], uri, True)
 
             elif method == "textDocument/didChange":
                 uri = msg["params"]["textDocument"]["uri"]
                 content = msg["params"]["contentChanges"][0]["text"]
-                documents[uri] = content
+                documents[uri] = content.replace("\r","")
                 jmcc_extension.clear(uri)
-                jmcc_extension.tokenize(content, uri, True)
+                jmcc_extension.tokenize(documents[uri], uri, True)
 
             elif method == "textDocument/completion":
                 uri = msg["params"]["textDocument"]["uri"]

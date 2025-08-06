@@ -556,12 +556,10 @@ def clear(source):
 
 def line_and_offset_to_pos(text: str, line, offset):
     start_pos = -1
-    while line >= 0:
-        start_pos = text.find("\n", start_pos) + 1
-        if start_pos == -1:
-            return -1
-        line-=1
-    return start_pos + offset
+    while line > 0:
+        start_pos = text.find("\n", start_pos + 1)
+        line -= 1
+    return start_pos + 1 + offset
 def pos_to_line_and_offset(txt:str, starting_pos, ending_pos):
     start_line_index = txt.rfind("\n", 0, starting_pos)
     start_line = txt.count("\n", 0, starting_pos)
