@@ -148,7 +148,7 @@ def main():
                 },
                 "completionProvider": {
                     "resolveProvider": False,
-                    "triggerCharacters": [":", "="]
+                    "triggerCharacters": [":", "=", "<"]
                 },
                 "hoverProvider": True,
                 "definitionProvider": True,
@@ -195,7 +195,7 @@ def main():
 
                 line = lines[line_num]
                 text_before = line[:char]
-                match = re.search(r"[\w:]*$", text_before)
+                match = re.search(r"[\w:<]*$", text_before)
                 if not match:
                     prefix = ""
                 else:
@@ -210,12 +210,16 @@ def main():
                     start_char = char - len(prefix)
                     if start_char < 0:
                         start_char = 0
+
+                    end_char = char
+                    if char < len(line) and line[char] == '>':
+                        end_char = char + 1
                     text_edit = {
                         "range": {
                             "start": {"line": line_num, "character": start_char},
-                            "end": {"line": line_num, "character": char}
+                            "end": {"line": line_num, "character": end_char}
                         },
-                        "newText": label 
+                        "newText": label
                     }
 
                     new_item = {**item}

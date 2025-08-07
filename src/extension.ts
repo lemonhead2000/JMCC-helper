@@ -35,16 +35,7 @@ function getClientOptions(): LanguageClientOptions {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.jc')
         },
         outputChannel: outputChannel,
-        outputChannelName: 'JMCC Language Server',
-        initializationOptions: {
-            capabilities: {
-                textDocument: {
-                    completion: {
-                        triggerCharacters: [":"]
-                    }
-                }
-            }
-        }
+        outputChannelName: 'JMCC Language Server'
     };
 }
 function getOrCreateTerminal(): vscode.Terminal {

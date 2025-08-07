@@ -121,25 +121,25 @@
 "variables": {
   "patterns": [
     {
-      "begin": "(?<=[\\s\\[:.\\(]|^)(?:(save|game|inline|local)\\s+)?(?:var\\s+)?(?:(s|i|g|l))?\\s*(`)",
-      "beginCaptures": {
-        "1": { "name": "keyword.control.storage.modifier.jc" },
-        "2": { "name": "storage.type.type.prefix.jc" },
-        "3": { "name": "storage.type.punctuation.definition.variable.begin.jc" }
-      },
-      "end": "(`)\\s*(?::\\s*([a-zA-Z_][a-zA-Z0-9_!$%]*))?\\s*(?=[=;{},.\\[\\]\\(\\)\\s]|$)",
-      "endCaptures": {
-        "1": { "name": "storage.type.punctuation.definition.variable.end.jc" },
-        "2": { "name": "storage.type.jc" }
-      },
-      "contentName": "variable.other.plain.jc",
-      "patterns": [
-        { "include": "#string-dollar-braced" },
-        { "include": "#string-dollar-bare" },
-        { "include": "#string-percent-function" },
-        { "include": "#string-percent" },
-        { "include": "#variables" }
-      ]
+      "begin": "(?<=[\\s\\[:.\\({,]|^)(?:(save|game|inline|local)\\s+)?(?:var\\s+)?(?:(s|i|g|l))?\\s*(`)",
+  "beginCaptures": {
+    "1": { "name": "keyword.control.storage.modifier.jc" },
+    "2": { "name": "storage.type.type.prefix.jc" },
+    "3": { "name": "storage.type.punctuation.definition.variable.begin.jc" }
+  },
+  "end": "(`)\\s*(?::\\s*([a-zA-Z_][a-zA-Z0-9_!$%]*))?\\s*(?=[->=;{},.\\[\\]\\(\\)\\s]|$)",
+  "endCaptures": {
+    "1": { "name": "storage.type.punctuation.definition.variable.end.jc" },
+    "2": { "name": "storage.type.jc" }
+  },
+  "contentName": "variable.other.plain.jc",
+  "patterns": [
+    { "include": "#string-dollar-braced" },
+    { "include": "#string-dollar-bare" },
+    { "include": "#string-percent-function" },
+    { "include": "#string-percent" },
+    { "include": "#variables" }
+  ]
     },
     {
       "match": "(?<=[\\s\\[:.\\(]|^)(?:(save|game|inline|local)\\s+)?(?:var\\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?::\\s*([a-zA-Z_][a-zA-Z0-9_!$%]*))?\\s*(?=[=;{}\\s\\.:]|$)",
