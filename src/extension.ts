@@ -152,9 +152,7 @@ async function checkAndUpdateAssets(context: vscode.ExtensionContext) {
           reject();
         });
       });
-    } catch (err) {
-      vscode.window.showWarningMessage('JMCC: Не удалось инициализировать компилятор. Функции автодополнения могут быть ограничены.');
-    }
+    } catch (err) { }
   }
 
   if (fs.existsSync(userPropsPath)) {
