@@ -4,137 +4,179 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { LanguageClient, LanguageClientOptions, ServerOptions, Executable } from 'vscode-languageclient/node';
 import * as https from 'https';
+import { spawn } from 'child_process';
 
 const TERMINAL_NAME = 'JMCC Terminal';
 let client: LanguageClient | undefined;
 
 async function checkAndUpdateAssets(context: vscode.ExtensionContext) {
-    const assetsDir = context.asAbsolutePath('out/assets');
-    const jmccDir = context.asAbsolutePath('out/JMCC');
-    if (!fs.existsSync(assetsDir)) {
-        fs.mkdirSync(assetsDir, { recursive: true });
-    }
-    if (!fs.existsSync(jmccDir)) {
-        fs.mkdirSync(jmccDir, { recursive: true });
-    }
+  const assetsDir = context.asAbsolutePath('out/assets');
+  const jmccDir = context.asAbsolutePath('out/JMCC');
+  if (!fs.existsSync(assetsDir)) fs.mkdirSync(assetsDir, { recursive: true });
+  if (!fs.existsSync(jmccDir)) fs.mkdirSync(jmccDir, { recursive: true });
 
-    const localPropsPath = path.join(jmccDir, 'jmcc.properties');
-    const REMOTE_PROPS_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/jmcc.properties';
-    const COMPLETIONS_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/assets/completions.json';
-    const HOVER_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/assets/hover.json';
-    const JMCC_PY_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/jmcc.py';
+  const REMOTE_PROPS_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/jmcc.properties';
+  const COMPLETIONS_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/assets/completions.json';
+  const HOVER_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/assets/hover.json';
+  const JMCC_PY_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilator/master/jmcc.py';
 
-    async function download(url: string): Promise<string | null> {
-        return new Promise(resolve => {
-            https.get(url, res => {
-                if (res.statusCode !== 200) return resolve(null);
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => resolve(data));
-            }).on('error', () => resolve(null));
+  async function download(url: string): Promise<string | null> {
+    return new Promise(resolve => {
+      https.get(url.trim(), res => {
+        if (res.statusCode !== 200) return resolve(null);
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve(data));
+      }).on('error', err => {
+        console.error('Download error:', err);
+        resolve(null);
+      });
+    });
+  }
+
+  function extractDataVersion(content: string): string | null {
+    const match = content.match(/^\s*data_version\s*=\s*(\S+)/m);
+    return match ? match[1].trim() : null;
+  }
+
+  function upsertProp(lines: string[], key: string, value: string): string[] {
+    const re = new RegExp(`^\\s*(#\\s*)?${key}\\s*=`, 'i');
+    let found = false;
+    const updated = lines.map(line => {
+      if (re.test(line)) {
+        found = true;
+        return `${key} = ${value}`;
+      }
+      return line;
+    });
+    if (!found) {
+      updated.push(`${key} = ${value}`);
+    }
+    return updated;
+  }
+
+  async function waitForFile(filePath: string, timeoutMs: number = 3000): Promise<boolean> {
+    const start = Date.now();
+    return new Promise(resolve => {
+      const check = () => {
+        if (fs.existsSync(filePath)) return resolve(true);
+        if (Date.now() - start > timeoutMs) return resolve(false);
+        setTimeout(check, 100);
+      };
+      check();
+    });
+  }
+
+  const files = [
+    { url: COMPLETIONS_URL, path: path.join(assetsDir, 'completions.json') },
+    { url: HOVER_URL, path: path.join(assetsDir, 'hover.json') },
+    { url: JMCC_PY_URL, path: path.join(jmccDir, 'jmcc.py') }
+  ];
+
+  for (const file of files) {
+    const content = await download(file.url);
+    if (content) {
+      fs.writeFileSync(file.path, content, 'utf8');
+      console.log(`Downloaded: ${file.path}`);
+    }
+  }
+
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) return;
+
+  const config = loadOrInitConfig(workspaceFolder);
+  const compilerPath = getCompilerPath(context, config);
+  const compilerDir = path.dirname(compilerPath);
+  const userPropsPath = path.join(compilerDir, 'jmcc.properties');
+
+  const REMOTE_PROPS_CONTENT = await download(REMOTE_PROPS_URL);
+  if (!REMOTE_PROPS_CONTENT) return;
+  const remoteDataVersion = extractDataVersion(REMOTE_PROPS_CONTENT);
+  if (!remoteDataVersion) return;
+
+  const propsExistedBefore = fs.existsSync(userPropsPath);
+  if (!propsExistedBefore) {
+    vscode.window.showInformationMessage('JMCC: Инициализация компилятора... Запуск jmcc.py');
+
+    const pythonCommand = os.platform() === 'win32' ? 'py' : 'python3';
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(pythonCommand, [compilerPath], {
+          cwd: compilerDir,
+          stdio: 'pipe',
+          shell: false
         });
+
+        let stderrData = '';
+        let stdoutData = '';
+
+        child.stderr.on('data', data => stderrData += data.toString());
+        child.stdout.on('data', data => stdoutData += data.toString());
+
+        child.on('close', async (code) => {
+          const exists = fs.existsSync(userPropsPath) || await waitForFile(userPropsPath);
+
+          if (!exists) {
+            fs.writeFileSync(
+              userPropsPath,
+              `# Auto-generated by JMCC extension\n`,
+              'utf8'
+            );
+          }
+
+          if (exists) {
+            let content = fs.readFileSync(userPropsPath, 'utf8');
+            let lines = content.split(/\r?\n/);
+
+            lines = upsertProp(lines, 'auto_update', 'True');
+            lines = upsertProp(lines, 'check_beta_versions', 'True');
+            lines = upsertProp(lines, 'data_version', remoteDataVersion);
+
+            fs.writeFileSync(userPropsPath, lines.join('\n'), 'utf8');
+            vscode.window.showInformationMessage('JMCC: Компилятор успешно инициализирован и настроен.');
+          }
+
+          if (code === 0) {
+            console.log('jmcc.py executed successfully.');
+            console.log('stdout:', stdoutData);
+            resolve();
+          } else {
+            console.error(`jmcc.py failed with code ${code}`);
+            console.error('stderr:', stderrData);
+            reject();
+          }
+        });
+
+        child.on('error', err => {
+          console.error('Spawn error:', err);
+          reject();
+        });
+      });
+    } catch (err) {
+      vscode.window.showWarningMessage('JMCC: Не удалось инициализировать компилятор. Функции автодополнения могут быть ограничены.');
     }
+  }
 
-    function extractDataVersion(content: string): string | null {
-        const match = content.match(/^\s*data_version\s*=\s*(\S+)/m);
-        return match ? match[1].trim() : null;
+  if (fs.existsSync(userPropsPath)) {
+    const localContent = fs.readFileSync(userPropsPath, 'utf8');
+    const localDataVersion = extractDataVersion(localContent);
+    if (localDataVersion !== remoteDataVersion) {
+      const contentCompletions = await download(COMPLETIONS_URL);
+      const contentHover = await download(HOVER_URL);
+      if (contentCompletions) {
+        fs.writeFileSync(path.join(assetsDir, 'completions.json'), contentCompletions, 'utf8');
+      }
+      if (contentHover) {
+        fs.writeFileSync(path.join(assetsDir, 'hover.json'), contentHover, 'utf8');
+      }
+
+      let lines = localContent.split(/\r?\n/);
+      lines = upsertProp(lines, 'data_version', remoteDataVersion);
+      fs.writeFileSync(userPropsPath, lines.join('\n'), 'utf8');
     }
-
-    const remotePropsContent = await download(REMOTE_PROPS_URL);
-    if (!remotePropsContent) return;
-    const remoteDataVersion = extractDataVersion(remotePropsContent);
-    if (!remoteDataVersion) return;
-
-    const hasLocalProps = fs.existsSync(localPropsPath);
-    let localDataVersion: string | null = null;
-
-    if (hasLocalProps) {
-        const content = fs.readFileSync(localPropsPath, 'utf8');
-        localDataVersion = extractDataVersion(content);
-    }
-
-    let updated = false;
-
-    if (!hasLocalProps) {
-        const files = [
-            { url: COMPLETIONS_URL, path: path.join(assetsDir, 'completions.json') },
-            { url: HOVER_URL, path: path.join(assetsDir, 'hover.json') },
-            { url: JMCC_PY_URL, path: path.join(jmccDir, 'jmcc.py') }
-        ];
-
-        for (const file of files) {
-            const content = await download(file.url);
-            if (content) {
-                fs.writeFileSync(file.path, content, 'utf8');
-            }
-        }
-
-        fs.writeFileSync(localPropsPath, `data_version = ${remoteDataVersion}\n`, 'utf8');
-        updated = true;
-    } else if (localDataVersion !== remoteDataVersion) {
-        const lines = fs.readFileSync(localPropsPath, 'utf8').split(/\r?\n/);
-        const updatedLines = lines.map(line =>
-            /^\s*data_version\s*=/.test(line)
-                ? `data_version = ${remoteDataVersion}`
-                : line
-        );
-        fs.writeFileSync(localPropsPath, updatedLines.join('\n'), 'utf8');
-
-        const assets = [
-            { url: COMPLETIONS_URL, path: path.join(assetsDir, 'completions.json') },
-            { url: HOVER_URL, path: path.join(assetsDir, 'hover.json') },
-            { url: JMCC_PY_URL, path: path.join(jmccDir, 'jmcc.py') }
-        ];
-
-        for (const asset of assets) {
-            const content = await download(asset.url);
-            if (content) {
-                fs.writeFileSync(asset.path, content, 'utf8');
-            }
-        }
-
-        updated = true;
-    }
-
-    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-    if (workspaceFolder) {
-        const config = loadOrInitConfig(workspaceFolder);
-        const userCompilerPath = config?.compilerPath?.trim();
-
-        if (userCompilerPath) {
-            const userDir = path.dirname(userCompilerPath);
-            const userPyPath = path.join(userDir, 'jmcc.py');
-            const userPropsPath = path.join(userDir, 'jmcc.properties');
-
-            const jmccPyContent = await download(JMCC_PY_URL);
-            if (jmccPyContent && fs.existsSync(userPyPath)) {
-                fs.writeFileSync(userPyPath, jmccPyContent, 'utf8');
-            }
-
-            if (fs.existsSync(userPropsPath)) {
-                const lines = fs.readFileSync(userPropsPath, 'utf8').split(/\r?\n/);
-                const updatedUser = lines.map(line =>
-                    /^\s*data_version\s*=/.test(line)
-                        ? `data_version = ${remoteDataVersion}`
-                        : line
-                ).join('\n');
-                fs.writeFileSync(userPropsPath, updatedUser, 'utf8');
-            }
-        }
-    }
-
-    if (updated) {
-        const choice = await vscode.window.showInformationMessage(
-            `JMCC: Обновлены данные до версии ${remoteDataVersion}. Перезапустить сервер?`,
-            'Да', 'Нет'
-        );
-        if (choice === 'Да' && client) {
-            await client.stop();
-            await client.start();
-            vscode.window.showInformationMessage('JMCC: Сервер перезапущен с новыми данными.');
-        }
-    }
+  }
 }
+
 
 function getServerOptions(context: vscode.ExtensionContext): ServerOptions {
     const pythonCommand = os.platform() === 'win32' ? 'py' : 'python3';
@@ -187,7 +229,6 @@ function loadOrInitConfig(workspaceFolder: vscode.WorkspaceFolder): any {
             clearTerminalBeforeCommand: true
         };
         fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf-8');
-        vscode.window.showWarningMessage(`Укажите путь к компилятору Python в файле: ${configPath}`);
     }
     let config;
     try {
