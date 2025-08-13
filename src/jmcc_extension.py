@@ -486,6 +486,7 @@ class Lexer:
             return Token(Tokens.EOF, "None", starting_pos, starting_pos, self.source)
         else:
             self.advance()
+            return self.next_token
 
     def get_remaining_tokens(self) -> list:
         lest = []
