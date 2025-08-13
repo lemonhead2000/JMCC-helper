@@ -120,35 +120,6 @@ class Token:
         return self.__str__()
 
 
-def error(error_type="", error_message="", starting_pos=-1, ending_pos=-1, source=None, txt=None):
-    if source is None:
-        msg = (f"&c{error_type} : {error_message}")
-        print(msg)
-    else:
-        if txt is None:
-            txt = global_text.setdefault(source, "")
-        start_line_index = txt.rfind("\n", 0, starting_pos)
-        start_line = txt.count("\n", 0, starting_pos)
-        ending_line_index = txt.find("\n", ending_pos)
-        if ending_line_index == -1:
-            ending_line_index = len(txt)
-        if start_line_index == -1:
-            start_line_index = 0
-        elif start_line_index > 0:
-            start_line_index += 1
-        msg = (
-                f"&c{('compilator.file')} \"{source}\":\n{start_line + 1}:{starting_pos - start_line_index + 1} - " +
-                txt[start_line_index:starting_pos] + "&4&n" +
-                txt[starting_pos:ending_pos + 1] + "&r&c" +
-                txt[ending_pos + 1:ending_line_index] + f"\n{error_type} : {error_message}")
-        print((msg))
-    raise Exception(msg)
-
-
-def error_from_object(obj, error_type="", error_message=""):
-    return error(error_type, error_message, obj.starting_pos, obj.ending_pos, obj.source)
-
-
 class Lexer:
     __slots__ = ("current_pos", "current_char", "allow_jmcc", "source", "text")
 
@@ -317,30 +288,19 @@ class Lexer:
                 else:
                     token_value += self.current_char
                 self.advance()
-            if self.current_char == mode:
-                self.advance()
-                if len(giga_token) == 0:
-                    if token_value.startswith("jmcc.") and mode not in {"\"", "\'"} and not self.allow_jmcc:
-                        error("NameError", ("error.nameerror.cant_use_jmcc"), starting_pos,
-                              self.current_pos - 1, self.source)
-                    return Token(token_type, token_value, starting_pos,
-                                 self.current_pos - 1, self.source)
-                else:
-                    if len(token_value) > 0:
-                        giga_token.append([
-                            Token(Tokens.STRING, token_value, starting_pos, self.current_pos - 1, self.source),
-                            Token(Tokens.NONE, "}", self.current_pos, self.current_pos, self.source)])
-                    release_index = global_text[self.source].index(mode if mode != ">" else "<", starting_pos,
-                                                                   self.current_pos - 1) + 1
-                    release = global_text[self.source][release_index:self.current_pos - 1]
-                    if release.startswith("jmcc.") and mode not in {"\"", "\'"}:
-                        error("NameError", ("error.nameerror.cant_use_jmcc"), starting_pos,
-                              self.current_pos - 1, self.source)
-                    return Token(token_type, release, starting_pos, self.current_pos - 1, self.source, giga=giga_token)
+            self.advance()
+            if len(giga_token) == 0:
+                return Token(token_type, token_value, starting_pos,
+                                self.current_pos - 1, self.source)
             else:
-                self.advance()
-                error("SyntaxError", ("error.syntaxerror.string_wasnt_closed"), starting_pos, self.current_pos,
-                      self.source)
+                if len(token_value) > 0:
+                    giga_token.append([
+                        Token(Tokens.STRING, token_value, starting_pos, self.current_pos - 1, self.source),
+                        Token(Tokens.NONE, "}", self.current_pos, self.current_pos, self.source)])
+                release_index = global_text[self.source].index(mode if mode != ">" else "<", starting_pos,
+                                                                self.current_pos - 1) + 1
+                release = global_text[self.source][release_index:self.current_pos - 1]
+                return Token(token_type, release, starting_pos, self.current_pos - 1, self.source, giga=giga_token)
 
         if self.current_char == "{":
             if sign_mode:
@@ -517,17 +477,15 @@ class Lexer:
                 self.advance()
                 return self.next_token
             else:
-                error("SyntaxError", ("error.syntaxerror.wrong_symbol", {0: "\\n", 1: self.current_char}),
-                      self.current_pos,
-                      self.current_pos, source=self.source)
+                return self.next_token
+            
         if self.current_char == "\n" or self.current_char == "\t":
             self.advance()
             return Token(Tokens.NEXT_LINE, "\n", starting_pos, starting_pos, self.source)
         if self.current_char == "":
             return Token(Tokens.EOF, "None", starting_pos, starting_pos, self.source)
         else:
-            error("SyntaxError", ("error.syntaxerror.unexpected_symbol", {0: self.current_char}), starting_pos,
-                  starting_pos, source=self.source)
+            self.advance()
 
     def get_remaining_tokens(self) -> list:
         lest = []
