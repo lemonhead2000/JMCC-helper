@@ -1,10 +1,18 @@
 import sys
 import json
-import os
-import re
 import logging
-from urllib.parse import urlparse, urlunparse, urljoin, unquote
-from urllib.request import urlopen
+import re
+import bisect
+import re
+import time
+from jmcc_extension import try_find_object
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+
+import jmcc_extension
+from jmcc_extension import Tokens
+
+DEBOUNCE_INTERVAL = 0.1
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,143 +20,247 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)]
 )
 
-def log(msg):
-    print(f"[LSP] {msg}", file=sys.stderr)
-    sys.stderr.flush()
-try:
-    import jmcc_extension
-except Exception as e:
-    log(f"Unhandled error: {e}")
-def load_json(filename):
-    try:
-        server_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(server_dir, "assets", filename)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            log(f"Loaded {len(data)} entries from {filename}")
-            return data
-    except Exception as e:
-        log(f"Failed to load {filename}: {e}")
-        return {} if "hover" in filename else []
-
-completions_db = load_json("completions.json")
-hover_db = load_json("hover.json")
-
-documents = {}
+def log(msg: str):
+    logging.info(msg)
 
 def read_message():
     try:
         headers = {}
         while True:
-            line = sys.stdin.buffer.readline().decode("utf-8", errors="replace").strip()
-            if line == "":
+            line = sys.stdin.buffer.readline().decode("utf-8", errors="replace")
+            if not line or line.strip() == "":
                 break
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            headers[key.strip()] = value.strip()
-
-        if "Content-Length" not in headers:
-            log("No Content-Length header")
+            key, val = line.split(":", 1)
+            headers[key.strip()] = val.strip()
+        length = int(headers.get("Content-Length", 0))
+        if length == 0:
             return None
-
-        content_length = int(headers["Content-Length"])
-        body = sys.stdin.buffer.read(content_length).decode("utf-8")
+        body = sys.stdin.buffer.read(length).decode("utf-8")
         return json.loads(body)
     except Exception as e:
         log(f"Error reading message: {e}")
         return None
 
-def send_message(msg):
+def send_message(msg: dict):
     try:
-        body = json.dumps(msg, ensure_ascii=False)
-        body_bytes = body.encode("utf-8")
-        headers = (
-            f"Content-Length: {len(body_bytes)}\r\n"
-            f"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n"
-            f"\r\n"
-        )
-        headers_bytes = headers.encode("utf-8")
-        sys.stdout.buffer.write(headers_bytes + body_bytes)
+        body = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+        header = (
+            f"Content-Length: {len(body)}\r\n"
+            "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n"
+            "\r\n"
+        ).encode("utf-8")
+        sys.stdout.buffer.write(header + body)
         sys.stdout.buffer.flush()
     except Exception as e:
         log(f"Error sending message: {e}")
 
 
-def uri_to_path(uri):
-    try:
-        parsed = urlparse(uri)
-        if parsed.scheme != "file":
-            return None
-        path = unquote(parsed.path)
-        if os.name == "nt":
-            if path.startswith("/"):
-                path = path[1:]
-            path = path.replace("/", "\\")
-        return path
-    except Exception as e:
-        log(f"Error parsing URI {uri}: {e}")
-        return None
-def path_to_uri(path):
-    path = os.path.abspath(path)
-    if os.name == "nt":
-        path = path.replace("\\", "/")
-    return f"file:///{path}"
+symbol_items = []
+symbol_index = {}
+symbol_labels = []
+document_states = {}
+file_cache = {}
 
-def read_document(uri):
+def uri_to_path(uri: str) -> Path | None:
+    p = urlparse(uri)
+    if p.scheme != "file":
+        return None
+    path = unquote(p.path)
+    if sys.platform.startswith("win") and path.startswith("/"):
+        path = path[1:]
+    return Path(path)
+
+def path_to_uri(path: Path) -> str:
+    p = path.resolve().as_posix()
+    if sys.platform.startswith("win"):
+        p = "/" + p
+    return "file://" + p
+
+def read_document(uri: str) -> str | None:
     path = uri_to_path(uri)
-    if not path or not os.path.exists(path):
+    if not path or not path.is_file():
         return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        log(f"Failed to read {path}: {e}")
+    mtime = path.stat().st_mtime
+    cached = file_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    text = path.read_text(encoding="utf-8").replace("\r", "")
+    file_cache[path] = (mtime, text)
+    return text
+
+def load_symbols():
+    global symbol_items, symbol_index, symbol_labels
+    if symbol_items:
+        return
+    assets = Path(__file__).parent / "assets" / "completions.json"
+    data = json.loads(assets.read_text(encoding="utf-8"))
+    symbol_items = data
+    for item in data:
+        label = item.get("label", "")
+        clean = re.sub(r"\(\)$", "", label)
+        symbol_index[clean] = item
+    symbol_labels = sorted(symbol_index.keys())
+    log(f"Loaded {len(symbol_labels)} symbols")
+
+def get_completions(prefix: str) -> list[dict]:
+    if not prefix:
+        return [it.copy() for it in symbol_items]
+    left = bisect.bisect_left(symbol_labels, prefix)
+    high = prefix + "\uffff"
+    right = bisect.bisect_right(symbol_labels, high)
+    return [symbol_index[symbol_labels[i]].copy() for i in range(left, right)]
+
+def compute_line_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for idx, ch in enumerate(text):
+        if ch == "\n":
+            offsets.append(idx + 1)
+    return offsets
+
+def ensure_tokens(uri: str):
+    state = document_states[uri]
+    now = time.time()
+    last = state.get("last_token_time", 0.0)
+    if state["dirty"] and (now - last) >= DEBOUNCE_INTERVAL:
+        jmcc_extension.clear(uri)
+        tokens = jmcc_extension.tokenize(state["text"], uri, True)
+        starts = [t.starting_pos for t in tokens]
+        offsets = compute_line_offsets(state["text"])
+        state.update({
+            "tokens": tokens,
+            "start_positions": starts,
+            "line_offsets": offsets,
+            "dirty": False,
+            "last_token_time": now
+        })
+        log(f"Tokenized {uri}: {len(tokens)} tokens")
+    return state
+
+def line_col_to_pos(line: int, col: int, offsets: list[int]) -> int:
+    return offsets[line] + col
+
+def pos_to_line_col(pos: int, offsets: list[int]) -> tuple[int,int]:
+    line = bisect.bisect_right(offsets, pos) - 1
+    col = pos - offsets[line]
+    return line, col
+
+_def_pattern = re.compile(
+    r"\b(?:class|function|process|var)\b.*?\b(\w+)\b|"
+    r"class\s+(\w+)\s*{"
+)
+
+def build_definitions(uri: str):
+    state = document_states[uri]
+    defs = {}
+    for i, line in enumerate(state["text"].splitlines()):
+        clean = line.split("//", 1)[0]
+        m = _def_pattern.search(clean)
+        if m:
+            name = m.group(1) or m.group(2)
+            col = clean.find(name)
+            defs[name] = {
+                "uri": uri,
+                "range": {
+                    "start": {"line": i, "character": col},
+                    "end":   {"line": i, "character": col + len(name)}
+                }
+            }
+    state["definitions"] = defs
+    state["defs_built"] = True
+    log(f"Built definitions for {uri}: {len(defs)} entries")
+
+def find_definition_in_state(uri: str, word: str):
+    if uri not in document_states:
+        text = read_document(uri)
+        if text is None:
+            return None
+
+        document_states[uri] = {
+            "text": text,
+            "dirty": False,
+            "tokens": [],
+            "start_positions": [],
+            "line_offsets": [],
+            "definitions": {},
+            "defs_built": False
+        }
+
+    state = document_states[uri]
+
+    if not state["defs_built"]:
+        build_definitions(uri)
+    return state["definitions"].get(word)
+
+def extract_imports(uri: str, content: str) -> list[str]:
+    results = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("import ") and '"' in line:
+            try:
+                path = line.split('"',2)[1]
+                results.append(path)
+            except:
+                pass
+    return results
+
+def resolve_import_uri(from_uri: str, import_path: str) -> str | None:
+    base = uri_to_path(from_uri)
+    if not base:
         return None
+    candidate = (base.parent / import_path).resolve()
+    if not candidate.is_file():
+        return None
+    return path_to_uri(candidate)
 
-def get_word_at_position(lines, line_num, char):
-    if line_num >= len(lines):
-        return None, -1, -1
-    line = lines[line_num]
-    if not line or char > len(line):
-        return None, -1, -1
+def parse_function_signature(line: str):
+    clean = line.split("//",1)[0]
+    m = re.search(
+        r"\b(?:function|process)\b\s+(\w+)\s*\(\s*([^)]*)\s*\)\s*(?:->\s*(\w+))?",
+        clean, re.IGNORECASE
+    )
+    if not m:
+        return None
+    name = m.group(1)
+    raw = m.group(2) or ""
+    params = []
+    for part in raw.split(","):
+        p = re.split(r"[:=]", part.strip())[0].strip()
+        if p:
+            params.append(p)
+    return {"name": name, "params": params}
 
-    start = char
-    while start > 0 and (line[start-1].isalnum() or line[start-1] in [":", "_"]):
-        start -= 1
-    end = char
-    while end < len(line) and (line[end].isalnum() or line[end] in [":", "_"]):
-        end += 1
+def get_signature_from_definition(start_uri: str, func_name: str):
+    visited = set()
+    def _search(uri):
+        if uri in visited:
+            return None
+        visited.add(uri)
+        text = document_states.get(uri,{}).get("text") or read_document(uri) or ""
+        for line in text.splitlines():
+            sig = parse_function_signature(line)
+            if sig and sig["name"] == func_name:
+                return sig
+        for imp in extract_imports(uri, text):
+            sub = resolve_import_uri(uri, imp)
+            if sub:
+                res = _search(sub)
+                if res:
+                    return res
+        return None
+    return _search(start_uri)
 
-    word = line[start:end]
-    return word, start, end
 
-def main():
-    log("Server starting")
-
-    while True:
-        try:
-            msg = read_message()
-            if msg is None:
-                continue
-
-            method = msg.get("method")
-            rpc_id = msg.get("id")
-
-            if method == "initialize":
-                log("initialize")
-                send_message({
+def handle_initialize(msg):
+    rpc_id = msg["id"]
+    load_symbols()
+    send_message({
         "id": rpc_id,
         "result": {
             "capabilities": {
-                "textDocumentSync": {
-                    "openClose": True,
-                    "change": 1,
-                    "save": True
-                },
+                "textDocumentSync": {"openClose": True, "change": 1, "save": True},
                 "completionProvider": {
                     "resolveProvider": False,
-                    "triggerCharacters": [":", "=", "<"]
+                    "triggerCharacters": [":", "=", "<", "."]
                 },
                 "hoverProvider": True,
                 "definitionProvider": True,
@@ -161,505 +273,534 @@ def main():
         }
     })
 
-            elif method == "initialized":
-                log("Client initialized")
-
-            elif method == "textDocument/didOpen":
-                uri = msg["params"]["textDocument"]["uri"]
-                text = msg["params"]["textDocument"]["text"]
-                documents[uri] = text.replace("\r","")
-                jmcc_extension.clear(uri)
-                jmcc_extension.tokenize(documents[uri], uri, True)
-
-            elif method == "textDocument/didChange":
-                uri = msg["params"]["textDocument"]["uri"]
-                content = msg["params"]["contentChanges"][0]["text"]
-                documents[uri] = content.replace("\r","")
-                jmcc_extension.clear(uri)
-                jmcc_extension.tokenize(documents[uri], uri, True)
-
-            elif method == "textDocument/completion":
-                uri = msg["params"]["textDocument"]["uri"]
-                pos = msg["params"]["position"]
-                line_num = pos["line"]
-                char = pos["character"]
-
-                if uri not in documents:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                lines = documents[uri].splitlines()
-                if line_num >= len(lines):
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                line = lines[line_num]
-                text_before = line[:char]
-                match = re.search(r"[\w:<]*$", text_before)
-                if not match:
-                    prefix = ""
-                else:
-                    prefix = match.group(0)
-                prefix = prefix.strip()
-
-                filtered_items = []
-                for item in completions_db:
-                    label = item.get("label", "")
-                    if prefix and not label.startswith(prefix):
-                        continue
-                    start_char = char - len(prefix)
-                    if start_char < 0:
-                        start_char = 0
-
-                    end_char = char
-                    if char < len(line) and line[char] == '>':
-                        end_char = char + 1
-                    text_edit = {
-                        "range": {
-                            "start": {"line": line_num, "character": start_char},
-                            "end": {"line": line_num, "character": end_char}
-                        },
-                        "newText": label
-                    }
-
-                    new_item = {**item}
-                    if "insertText" in new_item:
-                        del new_item["insertText"]
-                    new_item["textEdit"] = text_edit
-
-                    filtered_items.append(new_item)
-
-                send_message({
-                    "id": rpc_id,
-                    "result": {
-                        "isIncomplete": False,
-                        "items": filtered_items
-                    }
-                })
-
-            elif method == "textDocument/hover":
-                log("Hover requested")
-                uri = msg["params"]["textDocument"]["uri"]
-                pos = msg["params"]["position"]
-                line_num = pos["line"]
-                char = pos["character"]
-
-                if uri not in documents:
-                    log("Document not found")
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                if line_num >= documents[uri].count("\n")+1:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-                
-                token_index = jmcc_extension.find_token_that_have_pos(uri, jmcc_extension.line_and_offset_to_pos(documents[uri], line_num, char))
-                start, end = jmcc_extension.pos_to_line_and_offset(documents[uri], jmcc_extension.global_tokens[uri][token_index].starting_pos, jmcc_extension.global_tokens[uri][token_index].ending_pos)
-                word= jmcc_extension.try_find_object(uri, token_index)
-                if not word:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                log(f"Hover word detected: '{word}'")
-                
-                if word in hover_db:
-                    log(f"Hover found in JSON for '{word}'")
-                    send_message({
-                        "id": rpc_id,
-                        "result": {
-                            "contents": {
-                                "kind": "markdown",
-                                "value": hover_db[word]
-                            },
-                            "range": {
-                                "start": {"line": start[0], "character": start[1]},
-                                "end": {"line": end[0], "character": end[1]}
-                            }
-                        }
-                    })
-                else:
-                    log(f"No hover found for '{word}' in hover.json")
-                    send_message({"id": rpc_id, "result": None})
-
-            elif method == "textDocument/definition":
-                uri = msg["params"]["textDocument"]["uri"]
-                pos = msg["params"]["position"]
-                line_num = pos["line"]
-                char = pos["character"]
-
-                if uri not in documents:
-                    log("Document not found")
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                lines = documents[uri].splitlines()
-                word, start_char, _ = get_word_at_position(lines, line_num, char)
-                if not word:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                result = find_definition_in_file(uri, word)
-                if result:
-                    send_message({"id": rpc_id, "result": result})
-                    continue
-
-                imports = extract_imports(uri, documents[uri])
-                for import_path in imports:
-                    imported_uri = resolve_import_uri(uri, import_path)
-                    if not imported_uri:
-                        continue
-                    result = find_definition_in_file(imported_uri, word)
-                    if result:
-                        send_message({"id": rpc_id, "result": result})
-                        break
-                else:
-                    send_message({"id": rpc_id, "result": None})
-            
-            elif method == "textDocument/signatureHelp":
-                log("Signature help requested")
-                uri = msg["params"]["textDocument"]["uri"]
-                pos = msg["params"]["position"]
-                line_num = pos["line"]
-
-                if uri not in documents:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                lines = documents[uri].splitlines()
-                if line_num >= len(lines):
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                line = lines[line_num]
-                char = pos["character"]
-
-                bracket_pos = -1
-                paren_count = 0
-                for i in range(char - 1, -1, -1):
-                    c = line[i]
-                    if c == ")":
-                        paren_count += 1
-                    elif c == "(":
-                        if paren_count == 0:
-                            bracket_pos = i
-                            break
-                        else:
-                            paren_count -= 1
-                    elif c in " \t\n;{}":
-                        if paren_count == 0:
-                            break
-
-                if bracket_pos == -1:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                func_start = bracket_pos - 1
-                while func_start > 0 and (line[func_start - 1].isalnum() or line[func_start - 1] in "_"):
-                    func_start -= 1
-                func_name = line[func_start:bracket_pos].strip()
-
-                if not func_name:
-                    send_message({"id": rpc_id, "result": None})
-                    continue
-
-                log(f"Resolving signature for: '{func_name}'")
-
-                signatures = load_signatures()
-                sig_data = signatures.get(func_name)
-
-                if sig_data:
-                    log(f"Signature found in JSON for '{func_name}'")
-                else:
-
-                    log(f"🔍 Signature not in JSON, searching in code...")
-                    sig_data = get_signature_from_definition(uri, func_name)
-                    if sig_data:
-                        log(f"Signature generated from code: {sig_data['label']}")
-                    else:
-                        log(f"No signature found for '{func_name}' in JSON or code")
-                        send_message({"id": rpc_id, "result": None})
-                        continue
-
-                inner = line[bracket_pos + 1:char]
-                arg_idx = inner.count(",")
-
-                params = []
-                if isinstance(sig_data.get("params"), list):
-                    params = [{"label": p} for p in sig_data["params"]]
-                else:
-                    params = []
-
-                send_message({
-                    "id": rpc_id,
-                    "result": {
-                        "signatures": [
-                            {
-                                "label": sig_data.get("label", f"{func_name}(...)"),
-                                "documentation": sig_data.get("doc", ""),
-                                "parameters": params
-                            }
-                        ],
-                        "activeSignature": 0,
-                        "activeParameter": arg_idx
-                    }
-                })
- 
-            elif method == "textDocument/inlayHint":
-                log("Inlay hint requested")
-                uri = msg["params"]["textDocument"]["uri"]
-                if uri not in documents:
-                    send_message({"id": rpc_id, "result": []})
-                    continue
-                lines = documents[uri].splitlines()
-                hints = []
-                definition_lines = set()
-                for line_num, line in enumerate(lines):
-                    stripped = line.strip()
-                    if re.match(r"\b(?:function|process|inline\s+function)\b", stripped):
-                        definition_lines.add(line_num)
-
-                for line_num, line in enumerate(lines):
-                    if line_num in definition_lines:
-                        continue
-                    for match in re.finditer(r"\b(\w+)\s*\(([^)]*)\)", line):
-                        func_name = match.group(1)
-                        args_content = match.group(2)
-                        if not args_content.strip():
-                            continue
-                        args = []
-                        arg_positions = []
-                        paren_start = match.start(2)
-                        content = args_content
-                        arg_start_rel = 0
-                        i = 0
-                        while i < len(content):
-                            if content[i] in " \t":
-                                i += 1
-                                continue
-                            start = i
-                            while i < len(content) and content[i] not in ",)":
-                                i += 1
-                            raw_arg = content[start:i].strip()
-                            if raw_arg:
-                                arg_start_abs = paren_start + start
-                                arg_end_abs = paren_start + i
-                                args.append(raw_arg)
-                                arg_positions.append((arg_start_abs, arg_end_abs, raw_arg))
-                            if i < len(content) and content[i] == ",":
-                                i += 1
-                            else:
-                                break
-                        sig = get_signature_from_definition(uri, func_name)
-                        if not sig or not isinstance(sig.get("params"), list):
-                            continue
-
-                        params = sig["params"]
-                        for idx, (start_abs, end_abs, raw_arg) in enumerate(arg_positions):
-                            if "=" in raw_arg and raw_arg.split("=")[0].strip().isidentifier():
-                                continue
-                            if idx >= len(params):
-                                continue
-                            param_name = params[idx]
-                            if not param_name:
-                                continue
-                            char_pos = find_argument_position(line, raw_arg, match.start(1))
-                            if char_pos == -1:
-                                continue
-
-                            hints.append({
-                                "position": {
-                                    "line": line_num,
-                                    "character": char_pos
-                                },
-                                "label": f"{param_name}:",
-                                "kind": 1,
-                                "paddingLeft": False,
-                                "paddingRight": True
-                            })
-
-                log(f"Inlay hints sent: {len(hints)}")
-                send_message({
-                    "id": rpc_id,
-                    "result": hints
-                })
-
-            elif method == "exit":
-                log("Exit")
-                break
-
-            else:
-                if method not in ["textDocument/didSave", "textDocument/didChange"]:
-                    log(f"Unknown method: {method}")
-
-        except Exception as e:
-            log(f"Unhandled error: {e}")
-
-    log("Server stopped")
-    sys.exit(0)
-
-def extract_imports(uri, content):
-    imports = []
-    for i, line in enumerate(content.splitlines()):
-        line = line.strip()
-        if line.startswith("import ") and '"' in line:
-            try:
-                path = line.split('"')[1]
-                imports.append(path)
-            except Exception as e:
-                log(f"Failed to parse import line: {line}")
-                continue
-    return imports
-
-
-def resolve_import_uri(from_uri, import_path):
-    from_path = uri_to_path(from_uri)
-    if not from_path:
-        log(f"Can't resolve path from URI: {from_uri}")
-        return None
-    dir_path = os.path.dirname(from_path)
-    resolved_path = os.path.normpath(os.path.join(dir_path, import_path))
-    if not os.path.exists(resolved_path):
-        log(f"Imported file does not exist: {resolved_path}")
-        return None
-    if not os.path.isfile(resolved_path):
-        log(f"Imported path is not a file: {resolved_path}")
-        return None
-
-    uri = path_to_uri(resolved_path)
-    return uri
-
-def find_definition_in_file(uri, word):
-    content = documents.get(uri)
-    if not content:
-        content = read_document(uri)
-        if not content:
-            log(f"Failed to read content of {uri}")
-            return None
-    else:
-        log(f"Using cached document for {uri}")
-
-    lines = content.splitlines()
-
-    pattern = re.compile(
-        rf"\b(?:def|class|function|process|var)\b.*?\b{re.escape(word)}\b|"
-        rf"class\s+{re.escape(word)}\s*{{"
-    )
-
-    for i, line in enumerate(lines):
-        clean_line = line.split("//")[0].strip()
-
-        if pattern.search(clean_line):
-            idx = line.find(word)
-            if idx != -1:
-                return {
-                    "uri": uri,
-                    "range": {
-                        "start": {"line": i, "character": idx},
-                        "end": {"line": i, "character": idx + len(word)}
-                    }
-                }
-
-    log(f"No definition found for '{word}' in {uri}")
-    return None
-
-signatures_db = None
-def load_signatures():
-    global signatures_db
-    if signatures_db is not None:
-        return signatures_db
-    try:
-        server_dir = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(server_dir, "assets", "signatures.json")
-        with open(path, "r", encoding="utf-8") as f:
-            signatures_db = json.load(f)
-            log(f"Loaded {len(signatures_db)} signatures")
-            return signatures_db
-    except Exception as e:
-        log(f"Failed to load signatures: {e}")
-        return {}
-
-def parse_function_signature(line):
-    """
-    Парсит строки вида:
-        function __init__(self: vector2d, x: number, y: number) -> vector2d
-        inline function __multiply__(primal: text, secondary: number) -> text
-        function get_length(self: vector2d)
-    """
-    line = line.split("//")[0].strip()
-    is_inline = "inline" in line
-    clean_line = re.sub(r"\binline\b", "", line).strip()
-    match = re.search(
-        r"\b(?:function|process)\b\s+(\w+)\s*\(\s*([^)]*)\s*\)\s*(?:->\s*(\w+))?",
-        clean_line,
-        re.IGNORECASE
-    )
-    if not match:
-        return None
-
-    func_name = match.group(1)
-    params_str = match.group(2) or ""
-    return_type = match.group(3)
-    if params_str.strip():
-        raw_params = [p.strip() for p in params_str.split(",")]
-        param_names = []
-        for p in raw_params:
-            param_name = re.split(r"[:=]", p)[0].strip()
-            if param_name:
-                param_names.append(param_name)
-    else:
-        param_names = []
-    params_part = ", ".join(param_names)
-    return_part = f" -> {return_type}" if return_type else ""
-    label = f"{func_name}({params_part}){return_part}"
-
-    return {
-        "name": func_name,
-        "params": param_names,
-        "label": label,
-        "return_type": return_type,
-        "is_inline": is_inline
+def handle_did_open(msg):
+    uri = msg["params"]["textDocument"]["uri"]
+    text = msg["params"]["textDocument"]["text"].replace("\r", "")
+    document_states[uri] = {
+        "text": text,
+        "dirty": True,
+        "tokens": [],
+        "start_positions": [],
+        "line_offsets": [],
+        "definitions": {},
+        "defs_built": False,
+        "last_token_time": 0.0,
+        "inlay_dirty": True,
+        "inlay_hints": []
     }
+    jmcc_extension.clear(uri)
+    log(f"Opened {uri}")
 
-def get_signature_from_definition(start_uri, func_name):
-    visited_uris = set()
+def handle_did_change(msg):
+    uri = msg["params"]["textDocument"]["uri"]
+    text = msg["params"]["contentChanges"][0]["text"].replace("\r", "")
+    state = document_states.get(uri)
+    if state:
+        state["text"] = text
+        state["dirty"] = True
+        state["defs_built"] = False
+        state["inlay_dirty"] = True
+        jmcc_extension.clear(uri)
+        log(f"Changed {uri}")
 
-    def search(uri):
-        if uri in visited_uris:
-            log(f"Already visited: {uri}")
-            return None
-        visited_uris.add(uri)
+def handle_completion(msg):
+    rpc_id = msg["id"]
+    uri = msg["params"]["textDocument"]["uri"]
+    pos = msg["params"]["position"]
+    state = document_states.get(uri)
+    if not state:
+        send_message({"id": rpc_id, "result": {"isIncomplete":False,"items":[]}})
+        return
 
-        content = documents.get(uri) or read_document(uri)
-        if not content:
-            log(f"Failed to read {uri}")
-            return None
+    lines = state["text"].splitlines()
+    if pos["line"] >= len(lines):
+        send_message({"id": rpc_id, "result": {"isIncomplete":False,"items":[]}})
+        return
 
-        for line in content.splitlines():
-            sig = parse_function_signature(line)
-            if sig and sig["name"] == func_name:
-                return sig
+    line = lines[pos["line"]]
+    prefix = re.search(r"[\w:<]*$", line[:pos["character"]]).group(0)
+    items = get_completions(prefix)
 
-        imports = extract_imports(uri, content)
-        for imp_path in imports:
-            imported_uri = resolve_import_uri(uri, imp_path)
-            if not imported_uri:
-                log(f"Failed to resolve import: {imp_path}")
+    edits = []
+    for it in items:
+        lbl = it["label"]
+        start_ch = max(0, pos["character"] - len(prefix))
+        edits.append({
+            **it,
+            "textEdit": {
+                "range": {
+                    "start": {"line":pos["line"],"character":start_ch},
+                    "end":   {"line":pos["line"],"character":pos["character"]}
+                },
+                "newText": lbl
+            }
+        })
+
+    send_message({"id":rpc_id,"result":{"isIncomplete":False,"items":edits}})
+
+file_class_index: dict[str, dict[str, list[str]]] = {}
+
+def update_class_index(uri: str, text: str) -> None:
+    """
+    Обновляет file_class_index[uri], собирая все методы классов в этом тексте.
+    """
+    classes: dict[str, list[str]] = {}
+    for match in re.finditer(r'\bclass\s+(\w+)\s*\{', text):
+        class_name = match.group(1)
+        start = match.end() - 1
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    body = text[start+1:i]
+                    methods = re.findall(r'\bfunction\s+(\w+)\s*\(', body)
+                    classes[class_name] = methods
+                    break
+
+    file_class_index[uri] = classes
+
+def handle_hover(msg):
+    rpc_id = msg["id"]
+    uri    = msg["params"]["textDocument"]["uri"]
+    pos    = msg["params"]["position"]
+
+    try:
+        state = ensure_tokens(uri)
+        text   = state["text"]
+        offsets = state["line_offsets"]
+        prev_index = file_class_index.get(uri)
+        if prev_index is None or prev_index.get("_text_hash") != hash(text):
+            update_class_index(uri, text)
+            file_class_index[uri]["_text_hash"] = hash(text)
+
+        global_pos = line_col_to_pos(pos["line"], pos["character"], offsets)
+        idx = bisect.bisect_right(state["start_positions"], global_pos) - 1
+        if idx < 0 or idx >= len(state["tokens"]):
+            return send_message({"id": rpc_id, "result": None})
+
+        tok  = state["tokens"][idx]
+        word = try_find_object(uri, idx)
+        if not word:
+            return send_message({"id": rpc_id, "result": None})
+
+        contents = None
+
+        item = symbol_index.get(word)
+        if item and "documentation" in item:
+            doc = item["documentation"]
+            contents = doc if isinstance(doc, dict) else {"kind": "markdown", "value": str(doc)}
+
+        elif sig_def := get_signature_from_definition(uri, word):
+            params = sig_def.get("params", [])
+            md = "`(" + ", ".join(params) + ")`"
+            contents = {"kind": "markdown", "value": md}
+
+        else:
+            cls_methods = file_class_index.get(uri, {}).get(word)
+            if cls_methods:
+                md = f"**Методы класса `{word}`**:\n\n"
+                md += "\n".join(f"- `{m}()`" for m in sorted(cls_methods))
+                contents = {"kind": "markdown", "value": md}
+
+        if contents is None:
+            return send_message({"id": rpc_id, "result": None})
+
+        sl, sc = pos_to_line_col(tok.starting_pos, offsets)
+        el, ec = pos_to_line_col(tok.ending_pos,   offsets)
+
+        send_message({
+            "id": rpc_id,
+            "result": {
+                "contents": contents,
+                "range": {
+                    "start": {"line": sl, "character": sc},
+                    "end":   {"line": el, "character": ec}
+                }
+            }
+        })
+
+    except Exception as e:
+        print("Ошибка в handle_hover:", e)
+        send_message({"id": rpc_id, "result": None})
+
+def handle_definition(msg):
+    rpc_id = msg["id"]
+    uri = msg["params"]["textDocument"]["uri"]
+    pos = msg["params"]["position"]
+    state = document_states.get(uri)
+    if not state:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    lines = state["text"].splitlines()
+    if pos["line"] >= len(lines):
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    line = lines[pos["line"]]
+    word = None
+    for m in re.finditer(r"[\w_]+", line):
+        if m.start() <= pos["character"] <= m.end():
+            word = m.group(0)
+            break
+    if not word:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    loc = find_definition_in_state(uri, word)
+    if loc:
+        send_message({"id":rpc_id,"result":loc})
+        return
+
+    for imp in extract_imports(uri, state["text"]):
+        iuri = resolve_import_uri(uri, imp)
+        if iuri:
+            loc = find_definition_in_state(iuri, word)
+            if loc:
+                send_message({"id":rpc_id,"result":loc})
+                return
+
+    send_message({"id":rpc_id,"result":None})
+
+def handle_signature_help(msg):
+    rpc_id = msg["id"]
+    uri = msg["params"]["textDocument"]["uri"]
+    pos = msg["params"]["position"]
+    state = document_states.get(uri)
+    if not state:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    lines = state["text"].splitlines()
+    if pos["line"] >= len(lines):
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    line = lines[pos["line"]]
+    char = pos["character"]
+
+    bracket = -1
+    depth = 0
+    for i in range(char-1, -1, -1):
+        c = line[i]
+        if c == ")":
+            depth += 1
+        elif c == "(" and depth == 0:
+            bracket = i
+            break
+        elif c == "(":
+            depth -= 1
+    if bracket < 0:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    start = bracket-1
+    while start >= 0 and (line[start].isalnum() or line[start] in "_:<"):
+        start -= 1
+    func = line[start+1:bracket].strip()
+    if not func:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    item = symbol_index.get(func)
+    sig_data = None
+    if item and "signature" in item:
+        sig_data = item["signature"]
+    else:
+        sig_def = get_signature_from_definition(uri, func)
+        if sig_def:
+            sig_data = {
+                "label": f"{func}({', '.join(sig_def['params'])})",
+                "parameters": [{"label": p} for p in sig_def["params"]],
+                "documentation": ""
+            }
+    if not sig_data:
+        send_message({"id":rpc_id,"result":None})
+        return
+
+    inner = line[bracket+1:char]
+    active = inner.count(",")
+
+    send_message({
+        "id": rpc_id,
+        "result": {
+            "signatures": [
+                {
+                    "label": sig_data.get("label", f"{func}(...)"),
+                    "documentation": sig_data.get("documentation", ""),
+                    "parameters": [
+                        {"label": p.get("label", p["label"]), "documentation": p.get("documentation","")}
+                        for p in sig_data.get("parameters", [])
+                    ]
+                }
+            ],
+            "activeSignature": 0,
+            "activeParameter": active
+        }
+    })
+
+def handle_inlay_hints(msg):
+    rpc_id = msg["id"]
+    uri = msg["params"]["textDocument"]["uri"]
+    state = ensure_tokens(uri)
+    if not state["inlay_dirty"]:
+        send_message({"id": rpc_id, "result": state["inlay_hints"]})
+        return
+
+    tokens = state["tokens"]
+    offsets = state["line_offsets"]
+    lines = state["text"].splitlines()
+    hints = []
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+        func = None
+        open_idx = None
+        static_call = False
+        method_call = False
+        orig_method_call = False
+        block_vars = 0
+        drop_first = False
+
+        if tok.type == Tokens.VARIABLE and i + 1 < len(tokens) and tokens[i + 1].type == Tokens.LPAREN:
+            func, open_idx = tok.value, i + 1
+        elif tok.type == Tokens.VARIABLE and i + 3 < len(tokens) \
+             and tokens[i + 1].type == Tokens.DOUBLE_COLON \
+             and tokens[i + 2].type == Tokens.VARIABLE \
+             and tokens[i + 3].type == Tokens.LPAREN:
+            func = f"{tok.value}::{tokens[i + 2].value}"
+            open_idx = i + 3
+            static_call = True
+        elif tok.type == Tokens.VARIABLE and i + 3 < len(tokens) \
+             and tokens[i + 1].type == Tokens.DOT \
+             and tokens[i + 2].type == Tokens.VARIABLE \
+             and tokens[i + 3].type == Tokens.LPAREN:
+            raw_method = tokens[i + 2].value
+            func = f"{tok.value}.{raw_method}"
+            open_idx = i + 3
+            method_call = True
+            orig_method_call = True
+
+        if open_idx is None:
+            i += 1
+            continue
+
+        if method_call and func not in symbol_index:
+            for full_name in symbol_index:
+                if full_name.split("::")[-1] == raw_method:
+                    func = full_name
+                    static_call = True
+                    method_call = False
+                    break
+
+        depth = 0
+        close = None
+        for j in range(open_idx, len(tokens)):
+            t = tokens[j]
+            if t.type in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
+                depth += 1
+            elif t.type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+
+        if close is None:
+            i = open_idx + 1
+            continue
+
+        sl, sc = pos_to_line_col(tokens[open_idx].starting_pos, offsets)
+        prefix = lines[sl][:sc]
+        sig = parse_function_signature(lines[sl])
+        if sig and sig["name"] == func:
+            i = close + 1
+            continue
+
+        args = tokens[open_idx + 1 : close]
+        if not args:
+            i = close + 1
+            continue
+
+        params = []
+        if func in symbol_index and "signature" in symbol_index[func]:
+            sig_data = symbol_index[func]["signature"]
+            params = [
+                p["label"].split(":")[0].strip()
+                for p in sig_data.get("parameters", [])
+            ]
+        else:
+            sig_def = get_signature_from_definition(uri, func)
+            if sig_def:
+                params = sig_def["params"]
+
+        is_multiple_assignment = False
+        assigned_variable_count = 0
+        temp_search = i - 1
+        while temp_search >= 0:
+            if tokens[temp_search].type == Tokens.ASSIGN:
+                var_count = 0
+                temp_var_search = temp_search - 1
+                while temp_var_search >= 0:
+                    t2 = tokens[temp_var_search]
+                    if t2.type == Tokens.COMMA:
+                        pass
+                    elif t2.type == Tokens.VARIABLE:
+                        var_count += 1
+                    elif t2.type in (
+                        Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN,
+                        Tokens.NEXT_LINE, Tokens.SEMICOLON
+                    ):
+                        break
+                    temp_var_search -= 1
+                if var_count > 0:
+                    is_multiple_assignment = True
+                    assigned_variable_count = var_count
+                break
+            if tokens[temp_search].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
+                break
+            temp_search -= 1
+
+        has_return = False
+        temp_check = i - 1
+        while temp_check >= 0:
+            if tokens[temp_check].type == Tokens.RETURN:
+                has_return = True
+                break
+            if tokens[temp_check].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
+                break
+            temp_check -= 1
+
+        if orig_method_call or (static_call and '=' in prefix):
+            drop_first = True
+        if func == "repeat::on_range":
+            drop_first = True
+        if func.startswith("repeat::") and func != "repeat::on_range":
+            j = close + 1
+            while j < len(tokens) and tokens[j].type not in (
+                Tokens.CYCLE_THING, Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN
+            ):
+                if tokens[j].type in (
+                    Tokens.INLINE_VARIABLE, Tokens.LOCAL_VARIABLE,
+                    Tokens.GAME_VARIABLE, Tokens.SAVE_VARIABLE,
+                    Tokens.BRACKET_VARIABLE
+                ):
+                    block_vars += 1
+                j += 1
+            drop_first = False
+
+        if is_multiple_assignment and params:
+            has_named = any(t.type == Tokens.ASSIGN for t in args)
+            if has_named:
+                named = set()
+                for k, t3 in enumerate(args):
+                    if t3.type == Tokens.ASSIGN and k > 0 and args[k-1].type == Tokens.VARIABLE:
+                        named.add(args[k-1].value)
+                remaining = [p for p in params if p not in named]
+                params = [remaining[-1]] if remaining else []
+            else:
+                if assigned_variable_count > 0 and len(params) > assigned_variable_count:
+                    params = params[assigned_variable_count:]
+        else:
+            if drop_first and params:
+                params = params[1:]
+            if block_vars > 0:
+                params = params[block_vars:]
+
+        if has_return and params:
+            params = params[1:]
+        if not params:
+            i = close + 1
+            continue
+
+        def split_top(lst):
+            out, cur, lvl = [], [], 0
+            for t4 in lst:
+                if t4.type in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
+                    lvl += 1
+                elif t4.type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
+                    lvl -= 1
+                if t4.type == Tokens.COMMA and lvl == 0:
+                    out.append(cur)
+                    cur = []
+                else:
+                    cur.append(t4)
+            if cur:
+                out.append(cur)
+            return out
+
+        groups = split_top(args)
+        used_named = set()
+        pidx = 0
+
+        for grp in groups:
+            if not grp:
                 continue
-            log(f"Import found: {imp_path} → {imported_uri}")
-            result = search(imported_uri)
-            if result:
-                return result
+            if any(t.type == Tokens.ASSIGN for t in grp):
+                name = next((t.value for t in grp if t.type == Tokens.VARIABLE), None)
+                if name:
+                    used_named.add(name)
+                continue
+            while pidx < len(params) and params[pidx] in used_named:
+                pidx += 1
+            if pidx >= len(params):
+                break
+            first_token = None
+            for t5 in grp:
+                if t5.type != Tokens.NEXT_LINE:
+                    first_token = t5
+                    break
+            if first_token is None:
+                continue
+            ln, ch = pos_to_line_col(first_token.starting_pos, offsets)
+            hint = {
+                "position": {"line": ln, "character": ch},
+                "label": params[pidx] + ":",
+                "kind": 1,
+                "paddingLeft": False,
+                "paddingRight": True
+            }
+            hints.append(hint)
+            pidx += 1
 
-        return None
+        i = close + 1
 
-    return search(start_uri)
+    state["inlay_hints"] = hints
+    state["inlay_dirty"] = False
+    send_message({"id": rpc_id, "result": hints})
 
-def find_argument_position(line, arg, start_pos):
-    pattern = r'\b' + re.escape(arg) + r'\b'
-    match = re.search(pattern, line[start_pos:])
-    if match:
-        return start_pos + match.start()
-    return -1
-    
+def main():
+    log("Server starting")
+    while True:
+        msg = read_message()
+        if not msg:
+            continue
+        method = msg.get("method")
+        if method == "initialize":
+            handle_initialize(msg)
+        elif method == "textDocument/didOpen":
+            handle_did_open(msg)
+        elif method == "textDocument/didChange":
+            handle_did_change(msg)
+        elif method == "textDocument/completion":
+            handle_completion(msg)
+        elif method == "textDocument/hover":
+            handle_hover(msg)
+        elif method == "textDocument/definition":
+            handle_definition(msg)
+        elif method == "textDocument/signatureHelp":
+            handle_signature_help(msg)
+        elif method == "textDocument/inlayHint":
+            handle_inlay_hints(msg)
+        elif method == "exit":
+            log("Exit requested")
+            break
+        else:
+            if method not in ("textDocument/didSave",):
+                log(f"Unknown method: {method}")
+
 if __name__ == "__main__":
     main()
