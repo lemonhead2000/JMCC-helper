@@ -160,6 +160,10 @@ class Lexer:
                     token_type = Tokens.ELSE
                 case "function":
                     token_type = Tokens.FUNCTION_DEFINE
+                case "def":
+                    token_type = Tokens.FUNCTION_DEFINE
+                case "fun":
+                    token_type = Tokens.FUNCTION_DEFINE
                 case "process":
                     token_type = Tokens.PROCESS_DEFINE
                 case "var":
