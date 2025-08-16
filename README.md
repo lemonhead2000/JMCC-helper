@@ -47,7 +47,7 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 
 ## Установка
 
-1. Установите расширение из [Visual Studio Code Marketplace]().
+1. Установите расширение из [Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=lemonhead2000.jmcc-helper).
 2. Настройте файл `.jmccconfig.json` в папке `.vscode` вашего проекта, указав путь к компилятору Python.
 
 ### Команды
@@ -68,15 +68,12 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 ### Горячие клавиши
 - **F5**: Запуск активного файла (компиляция для `.jc` или декомпиляция для `.json`).
 
-### Конфигурация
-Настройте файл `.jmccconfig.json` в папке `.vscode` вашего проекта:
-
+## Конфигурация
+### Настройка конфига
 ```json
 {
   "compilerPath": "COMPILER_PATH",
-  "defaultCompileActiveFileMode": "COMPILE_TYPE",
-  "compilerOutputPath": "OUTPUT_FILE",
-  "clearTerminalBeforeCommand": true
+  "compilerOutputPath": "OUTPUT_FILE"
 }
 ```
 | Поле | Описание |
@@ -85,6 +82,19 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 | `defaultCompileActiveFileMode` | Режим компиляции активного файла:<br><br>• `"UPLOAD"` — результат загружается в облако<br>• `"SAVE"` — файл сохраняется локально по пути из `compilerOutputPath`<br>• `"BOTH"` — выполняется и загрузка, и сохранение |
 | `compilerOutputPath` | Путь для сохранения скомпилированных или декомпилированных файлов. Если не указан, файл сохраняется в той же папке, где находится исходный файл. |
 | `clearTerminalBeforeCommand` | Если `true`, перед выполнением каждой команды консоль будет очищаться. |
+
+### UI-настройки
+| Настройка                                      | Тип                                   | Значение по умолчанию | Описание                                                   |
+|-----------------------------------------------|---------------------------------------|-----------------------|------------------------------------------------------------|
+| jmcc-helper.hideInlayHints                    | boolean                               | false                 | Скрывать inlay hints (текстовые аннотации рядом с кодом)    |
+| jmcc-helper.hideHover                         | boolean                               | false                 | Отключить показ информации при наведении (hover)           |
+| jmcc-helper.hideCompletion                    | boolean                               | false                 | Отключить автодополнение                                    |
+| jmcc-helper.hideSignatureHelp                 | boolean                               | false                 | Отключить подсказки по сигнатурам функций                   |
+| jmcc-helper.defaultCompileActiveFileMode      | enum (UPLOAD, SAVE, BOTH)             | UPLOAD                | Режим компиляции активного файла при нажатии F5            |
+| jmcc-helper.clearTerminalBeforeCommand        | boolean                               | true                  | Очищать терминал перед выполнением каждой команды          |
+| jmcc-helper.compilerPath                      | string                                | ""                    | Путь к исполняемому JMCC  |
+| jmcc-helper.compilerOutputPath                | string                                | ""                    | Путь для сохранения скомпилированных/декомпилированных файлов |
+| jmcc-helper.autoCreateConfig                  | boolean                               | true                  | Автоматически создавать `.jmccconfig.json` в папке `.vscode` |
 
 ## Разработка
 
