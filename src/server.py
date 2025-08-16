@@ -8,7 +8,6 @@ import time
 from jmcc_extension import try_find_object
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-
 import jmcc_extension
 from jmcc_extension import Tokens
 
@@ -145,7 +144,7 @@ def pos_to_line_col(pos: int, offsets: list[int]) -> tuple[int,int]:
     return line, col
 
 _def_pattern = re.compile(
-    r"\b(?:class|function|process|var)\b.*?\b(\w+)\b|"
+    r"\b(?:class|function|process|var|def|fun)\b.*?\b(\w+)\b|"
     r"class\s+(\w+)\s*{"
 )
 
@@ -215,7 +214,7 @@ def resolve_import_uri(from_uri: str, import_path: str) -> str | None:
 def parse_function_signature(line: str):
     clean = line.split("//",1)[0]
     m = re.search(
-        r"\b(?:function|process)\b\s+(\w+)\s*\(\s*([^)]*)\s*\)\s*(?:->\s*(\w+))?",
+        r"\b(?:function|process|def|fun)\b\s+(\w+)\s*\(\s*([^)]*)\s*\)\s*(?:->\s*(\w+))?",
         clean, re.IGNORECASE
     )
     if not m:
@@ -251,27 +250,55 @@ def get_signature_from_definition(start_uri: str, func_name: str):
 
 
 def handle_initialize(msg):
+    global HIDE_INLAY_HINTS
+    global HIDE_HOVER
+    global HIDE_COMPLETION
+    global HIDE_SIGNATURE_HELP
+
     rpc_id = msg["id"]
+    params = msg.get("params", {})
+    init_opts = params.get("initializationOptions", {})
+    HIDE_INLAY_HINTS            = init_opts.get("hideInlayHints", False)
+    HIDE_HOVER                  = init_opts.get("hideHover", False)
+    HIDE_COMPLETION             = init_opts.get("hideCompletion", False)
+    HIDE_SIGNATURE_HELP         = init_opts.get("hideSignatureHelp", False)
     load_symbols()
+    capabilities_dict = {
+        "textDocumentSync": {"openClose": True, "change": 1, "save": True},
+        "completionProvider": {
+            "resolveProvider": False,
+            "triggerCharacters": [":", "=", "<", "."]
+        } if not HIDE_COMPLETION else None,
+        "hoverProvider": not HIDE_HOVER,
+        "definitionProvider": True,
+        "signatureHelpProvider": {
+            "triggerCharacters": ["(", ","],
+            "retriggerCharacters": [")"]
+        } if not HIDE_SIGNATURE_HELP else None,
+        "inlayHintProvider": not HIDE_INLAY_HINTS
+    }
+    capabilities_dict = {k: v for k, v in capabilities_dict.items() if v is not None}
     send_message({
         "id": rpc_id,
         "result": {
-            "capabilities": {
-                "textDocumentSync": {"openClose": True, "change": 1, "save": True},
-                "completionProvider": {
-                    "resolveProvider": False,
-                    "triggerCharacters": [":", "=", "<", "."]
-                },
-                "hoverProvider": True,
-                "definitionProvider": True,
-                "signatureHelpProvider": {
-                    "triggerCharacters": ["(", ","],
-                    "retriggerCharacters": [")"]
-                },
-                "inlayHintProvider": True
-            }
+            "capabilities": capabilities_dict
         }
     })
+
+def handle_did_change_configuration(msg):
+    cfg = msg.get("params", {})\
+             .get("settings", {})\
+             .get("jmcc-helper", {})
+
+    global HIDE_INLAY_HINTS, HIDE_HOVER, HIDE_COMPLETION, HIDE_SIGNATURE_HELP
+
+    HIDE_INLAY_HINTS    = cfg.get("hideInlayHints",    HIDE_INLAY_HINTS)
+    HIDE_HOVER          = cfg.get("hideHover",         HIDE_HOVER)
+    HIDE_COMPLETION     = cfg.get("hideCompletion",    HIDE_COMPLETION)
+    HIDE_SIGNATURE_HELP = cfg.get("hideSignatureHelp", HIDE_SIGNATURE_HELP)
+
+    log(f"Config updated: inlay={HIDE_INLAY_HINTS} hover={HIDE_HOVER} "
+        f"completion={HIDE_COMPLETION} signature={HIDE_SIGNATURE_HELP}")
 
 def handle_did_open(msg):
     uri = msg["params"]["textDocument"]["uri"]
@@ -306,6 +333,9 @@ def handle_did_change(msg):
 def handle_completion(msg):
     rpc_id = msg["id"]
     uri = msg["params"]["textDocument"]["uri"]
+    if HIDE_COMPLETION:
+        send_message({"id": rpc_id, "result": []})
+        return
     pos = msg["params"]["position"]
     state = document_states.get(uri)
     if not state:
@@ -341,9 +371,6 @@ def handle_completion(msg):
 file_class_index: dict[str, dict[str, list[str]]] = {}
 
 def update_class_index(uri: str, text: str) -> None:
-    """
-    Обновляет file_class_index[uri], собирая все методы классов в этом тексте.
-    """
     classes: dict[str, list[str]] = {}
     for match in re.finditer(r'\bclass\s+(\w+)\s*\{', text):
         class_name = match.group(1)
@@ -365,6 +392,9 @@ def update_class_index(uri: str, text: str) -> None:
 def handle_hover(msg):
     rpc_id = msg["id"]
     uri    = msg["params"]["textDocument"]["uri"]
+    if HIDE_HOVER:
+        send_message({"id": rpc_id, "result": []})
+        return
     pos    = msg["params"]["position"]
 
     try:
@@ -468,6 +498,9 @@ def handle_definition(msg):
 def handle_signature_help(msg):
     rpc_id = msg["id"]
     uri = msg["params"]["textDocument"]["uri"]
+    if HIDE_SIGNATURE_HELP:
+        send_message({"id": rpc_id, "result": []})
+        return
     pos = msg["params"]["position"]
     state = document_states.get(uri)
     if not state:
@@ -545,17 +578,18 @@ def handle_signature_help(msg):
 def handle_inlay_hints(msg):
     rpc_id = msg["id"]
     uri = msg["params"]["textDocument"]["uri"]
+    if HIDE_INLAY_HINTS:
+        send_message({"id": rpc_id, "result": []})
+        return
     state = ensure_tokens(uri)
     if not state["inlay_dirty"]:
         send_message({"id": rpc_id, "result": state["inlay_hints"]})
         return
-
     tokens = state["tokens"]
     offsets = state["line_offsets"]
     lines = state["text"].splitlines()
     hints = []
     i = 0
-
     while i < len(tokens):
         tok = tokens[i]
         func = None
@@ -565,7 +599,6 @@ def handle_inlay_hints(msg):
         orig_method_call = False
         block_vars = 0
         drop_first = False
-
         if tok.type == Tokens.VARIABLE and i + 1 < len(tokens) and tokens[i + 1].type == Tokens.LPAREN:
             func, open_idx = tok.value, i + 1
         elif tok.type == Tokens.VARIABLE and i + 3 < len(tokens) \
@@ -584,11 +617,9 @@ def handle_inlay_hints(msg):
             open_idx = i + 3
             method_call = True
             orig_method_call = True
-
         if open_idx is None:
             i += 1
             continue
-
         if method_call and func not in symbol_index:
             for full_name in symbol_index:
                 if full_name.split("::")[-1] == raw_method:
@@ -596,7 +627,6 @@ def handle_inlay_hints(msg):
                     static_call = True
                     method_call = False
                     break
-
         depth = 0
         close = None
         for j in range(open_idx, len(tokens)):
@@ -608,23 +638,19 @@ def handle_inlay_hints(msg):
                 if depth == 0:
                     close = j
                     break
-
         if close is None:
             i = open_idx + 1
             continue
-
         sl, sc = pos_to_line_col(tokens[open_idx].starting_pos, offsets)
         prefix = lines[sl][:sc]
         sig = parse_function_signature(lines[sl])
         if sig and sig["name"] == func:
             i = close + 1
             continue
-
         args = tokens[open_idx + 1 : close]
         if not args:
             i = close + 1
             continue
-
         params = []
         if func in symbol_index and "signature" in symbol_index[func]:
             sig_data = symbol_index[func]["signature"]
@@ -636,7 +662,44 @@ def handle_inlay_hints(msg):
             sig_def = get_signature_from_definition(uri, func)
             if sig_def:
                 params = sig_def["params"]
-
+        is_repeat_function = func.startswith("repeat::")
+        repeat_block_offset = 0
+        
+        if is_repeat_function:
+            j = close + 1
+            while j < len(tokens) and tokens[j].type != Tokens.LCPAREN:
+                j += 1
+            
+            if j < len(tokens) and tokens[j].type == Tokens.LCPAREN:
+                block_start = j
+                block_end = None
+                block_depth = 0
+                
+                for k in range(j, len(tokens)):
+                    if tokens[k].type == Tokens.LCPAREN:
+                        block_depth += 1
+                    elif tokens[k].type == Tokens.RCPAREN:
+                        block_depth -= 1
+                        if block_depth == 0:
+                            block_end = k
+                            break
+                
+                if block_end:
+                    for k in range(block_start, block_end):
+                        if tokens[k].type == Tokens.CYCLE_THING:
+                            vars_before_arrow = 0
+                            for l in range(block_start + 1, k):
+                                if tokens[l].type == Tokens.VARIABLE:
+                                    vars_before_arrow += 1
+                                elif tokens[l].type == Tokens.COMMA:
+                                    vars_before_arrow += 1
+                            
+                            if func == "repeat::for_each_in_list":
+                                repeat_block_offset = max(0, vars_before_arrow - 2)
+                            else:
+                                repeat_block_offset = max(0, vars_before_arrow - 1)
+                            break
+        
         is_multiple_assignment = False
         assigned_variable_count = 0
         temp_search = i - 1
@@ -663,7 +726,6 @@ def handle_inlay_hints(msg):
             if tokens[temp_search].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
                 break
             temp_search -= 1
-
         has_return = False
         temp_check = i - 1
         while temp_check >= 0:
@@ -673,25 +735,38 @@ def handle_inlay_hints(msg):
             if tokens[temp_check].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
                 break
             temp_check -= 1
-
         if orig_method_call or (static_call and '=' in prefix):
             drop_first = True
-        if func == "repeat::on_range":
-            drop_first = True
-        if func.startswith("repeat::") and func != "repeat::on_range":
+        if is_repeat_function:
             j = close + 1
-            while j < len(tokens) and tokens[j].type not in (
-                Tokens.CYCLE_THING, Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN
-            ):
-                if tokens[j].type in (
-                    Tokens.INLINE_VARIABLE, Tokens.LOCAL_VARIABLE,
-                    Tokens.GAME_VARIABLE, Tokens.SAVE_VARIABLE,
-                    Tokens.BRACKET_VARIABLE
-                ):
-                    block_vars += 1
+            found_block = False
+            while j < len(tokens):
+                if tokens[j].type == Tokens.LCPAREN:
+                    block_start = j
+                    block_depth = 0
+                    block_end = None
+                    for k in range(j, len(tokens)):
+                        if tokens[k].type == Tokens.LCPAREN:
+                            block_depth += 1
+                        elif tokens[k].type == Tokens.RCPAREN:
+                            block_depth -= 1
+                            if block_depth == 0:
+                                block_end = k
+                                break
+                    
+                    if block_end:
+                        for k in range(block_start, block_end):
+                            if tokens[k].type == Tokens.CYCLE_THING:
+                                found_block = True
+                                break
+                    break
+                elif tokens[j].type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN, Tokens.NEXT_LINE, Tokens.SEMICOLON):
+                    break
                 j += 1
-            drop_first = False
-
+            if found_block:
+                drop_first = True
+            else:
+                drop_first = False
         if is_multiple_assignment and params:
             has_named = any(t.type == Tokens.ASSIGN for t in args)
             if has_named:
@@ -706,16 +781,21 @@ def handle_inlay_hints(msg):
                     params = params[assigned_variable_count:]
         else:
             if drop_first and params:
-                params = params[1:]
+                if len(params) > 1:
+                    params = params[1:]
             if block_vars > 0:
                 params = params[block_vars:]
-
         if has_return and params:
-            params = params[1:]
+            if len(params) > 1:
+                params = params[1:]
+        if is_repeat_function and repeat_block_offset > 0:
+            if len(params) > repeat_block_offset:
+                params = params[repeat_block_offset:]
+            else:
+                params = []
         if not params:
             i = close + 1
             continue
-
         def split_top(lst):
             out, cur, lvl = [], [], 0
             for t4 in lst:
@@ -731,11 +811,9 @@ def handle_inlay_hints(msg):
             if cur:
                 out.append(cur)
             return out
-
         groups = split_top(args)
         used_named = set()
         pidx = 0
-
         for grp in groups:
             if not grp:
                 continue
@@ -765,9 +843,7 @@ def handle_inlay_hints(msg):
             }
             hints.append(hint)
             pidx += 1
-
         i = close + 1
-
     state["inlay_hints"] = hints
     state["inlay_dirty"] = False
     send_message({"id": rpc_id, "result": hints})
@@ -781,6 +857,8 @@ def main():
         method = msg.get("method")
         if method == "initialize":
             handle_initialize(msg)
+        elif method == "workspace/didChangeConfiguration":
+            handle_did_change_configuration(msg)
         elif method == "textDocument/didOpen":
             handle_did_open(msg)
         elif method == "textDocument/didChange":

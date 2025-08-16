@@ -21,9 +21,7 @@ const JMCC_PY_URL = 'https://raw.githubusercontent.com/donzgold/JustMC_compilato
 
 interface JMCCConfig {
     compilerPath: string;
-    defaultCompileActiveFileMode: string;
     compilerOutputPath: string;
-    clearTerminalBeforeCommand: boolean;
 }
 
 interface JsonFunctionCall {
@@ -49,6 +47,28 @@ interface NameMapping {
 let client: LanguageClient | undefined;
 
 
+async function ensureDocumentSaved(uri: vscode.Uri): Promise<void> {
+  const doc = await vscode.workspace.openTextDocument(uri);
+  if (doc.isDirty) {
+    await doc.save();
+  }
+}
+
+function shouldClearTerminal(): boolean {
+  return getSettings().get<boolean>('clearTerminalBeforeCommand', true);
+}
+
+function getDefaultCompileMode(): 'UPLOAD' | 'SAVE' | 'BOTH' {
+  return getSettings()
+    .get<string>('defaultCompileActiveFileMode', 'UPLOAD')
+    .toUpperCase() as 'UPLOAD' | 'SAVE' | 'BOTH';
+}
+
+function getSettings(): vscode.WorkspaceConfiguration {
+  
+  return vscode.workspace.getConfiguration('jmcc-helper');
+}
+
 function getConfigPath(workspaceFolder: vscode.WorkspaceFolder): string {
     const configDir = path.join(workspaceFolder.uri.fsPath, '.vscode');
     if (!fs.existsSync(configDir)) {
@@ -58,56 +78,56 @@ function getConfigPath(workspaceFolder: vscode.WorkspaceFolder): string {
 }
 
 function loadOrInitConfig(workspaceFolder: vscode.WorkspaceFolder): JMCCConfig {
-    const configPath = getConfigPath(workspaceFolder);
-    let config: JMCCConfig;
+  const configPath = getConfigPath(workspaceFolder);
+  const defaultConfig: JMCCConfig = {
+    compilerPath: '',
+    compilerOutputPath: ''
+  };
+  const autoCreateConfig = getSettings().get<boolean>('autoCreateConfig', true);
+  if (!fs.existsSync(configPath)) {
+    if (autoCreateConfig) {
+      fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf-8');
+    }
+    return defaultConfig;
+  }
+  let config: JMCCConfig;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  } catch (err) {
+    vscode.window.showErrorMessage(
+      `JMCC: Ошибка чтения ${path.basename(configPath)}. Проверьте формат JSON.`
+    );
+    throw err;
+  }
+  let modified = false;
+  if (typeof config.compilerPath !== 'string') {
+    config.compilerPath = '';
+    modified = true;
+  }
+  if (typeof config.compilerOutputPath !== 'string') {
+    config.compilerOutputPath = '';
+    modified = true;
+  }
+  if (modified && autoCreateConfig) {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  }
 
-    if (!fs.existsSync(configPath)) {
-        const defaultConfig: JMCCConfig = {
-            compilerPath: "",
-            defaultCompileActiveFileMode: "UPLOAD",
-            compilerOutputPath: "",
-            clearTerminalBeforeCommand: true
-        };
-        fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf-8');
-        return defaultConfig;
-    }
-
-    try {
-        config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    } catch (err) {
-        vscode.window.showErrorMessage(`JMCC: Ошибка чтения ${CONFIG_FILE_NAME}. Проверьте формат JSON.`);
-        throw err;
-    }
-
-    let modified = false;
-    if (!config.defaultCompileActiveFileMode) {
-        config.defaultCompileActiveFileMode = 'UPLOAD';
-        modified = true;
-    } else if (config.defaultCompileActiveFileMode.toUpperCase() === 'FILE') {
-        config.defaultCompileActiveFileMode = 'SAVE';
-        modified = true;
-    }
-    if (config.compilerOutputPath === undefined) {
-        config.compilerOutputPath = '';
-        modified = true;
-    }
-    if (config.clearTerminalBeforeCommand === undefined) {
-        config.clearTerminalBeforeCommand = true;
-        modified = true;
-    }
-
-    if (modified) {
-        fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
-    }
-    return config;
+  return config;
 }
+
 
 function getCompilerPath(context: vscode.ExtensionContext, config: JMCCConfig): string {
-    if (config.compilerPath?.trim()) {
-        return path.normalize(config.compilerPath);
-    }
-    return context.asAbsolutePath(path.join('out', JMCC_DIR_NAME, COMPILER_SCRIPT_NAME));
+  const settingPath = getSettings().get<string>('compilerPath', '').trim();
+
+  if (config.compilerPath?.trim()) {
+    return path.normalize(config.compilerPath);
+  }
+  if (settingPath) {
+    return path.normalize(settingPath);
+  }
+  return context.asAbsolutePath(path.join('out', JMCC_DIR_NAME, COMPILER_SCRIPT_NAME));
 }
+
 
 function validatePath(filePath: string, isFile: boolean = false): boolean {
     try {
@@ -137,15 +157,15 @@ function getOrCreateTerminal(): vscode.Terminal {
 }
 
 function runCommand(command: string, workspaceFolder: vscode.WorkspaceFolder) {
-    const config = loadOrInitConfig(workspaceFolder);
-    const terminal = getOrCreateTerminal();
-    terminal.show();
+  const terminal = getOrCreateTerminal();
+  terminal.show();
 
-    if (config.clearTerminalBeforeCommand !== false) {
-        const clearCommand = os.platform() === 'win32' ? 'cls' : 'clear';
-        terminal.sendText(clearCommand);
-    }
-    terminal.sendText(command);
+  if (shouldClearTerminal()) {
+    const clearCmd = os.platform() === 'win32' ? 'cls' : 'clear';
+    terminal.sendText(clearCmd);
+  }
+
+  terminal.sendText(command);
 }
 
 function buildBaseCommandArgs(compilerPath: string, targetPath: string): string[] {
@@ -173,11 +193,13 @@ function compile(targetPath: string, mode: string, workspaceFolder: vscode.Works
         args.push('-su');
     }
 
-    const shouldUseOutputPath = (mode === 'SAVE' || mode === 'BOTH' || isCompileAsFile) && config.compilerOutputPath?.trim();
-    if (shouldUseOutputPath) {
-        const normalizedOutputPath = path.normalize(config.compilerOutputPath);
-        if (!validatePath(normalizedOutputPath, true)) {
-            vscode.window.showErrorMessage(`JMCC: Путь для вывода должен быть файлом: ${normalizedOutputPath}`);
+    const settingOut = getSettings().get<string>('compilerOutputPath', '').trim();
+    const outPath = (config.compilerOutputPath?.trim() || settingOut) ?? '';
+
+    if ((mode === 'SAVE' || mode === 'BOTH' || isCompileAsFile) && outPath) {
+        const normalizedOutputPath = path.normalize(outPath);
+        if (!validatePath(normalizedOutputPath, false)) {
+            vscode.window.showErrorMessage(`JMCC: Неверный путь для вывода: ${normalizedOutputPath}`);
             return;
         }
         args.push('-o', `"${normalizedOutputPath}"`);
@@ -737,15 +759,26 @@ function getServerOptions(context: vscode.ExtensionContext): ServerOptions {
 }
 
 function getClientOptions(): LanguageClientOptions {
-    const outputChannel = vscode.window.createOutputChannel('JMCC Language Server');
-    return {
-        documentSelector: [{ scheme: 'file', language: 'justcode' }],
-        synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.jc')
-        },
-        outputChannel: outputChannel,
-        outputChannelName: 'JMCC Language Server'
-    };
+  
+  const settings = getSettings();
+
+  return {
+    documentSelector: [{ scheme: 'file', language: 'justcode' }],
+    synchronize: {
+      fileEvents: vscode.workspace.createFileSystemWatcher('**/*.jc'),
+      configurationSection: 'jmcc-helper'
+    },
+    initializationOptions: {
+      hideInlayHints:    settings.get<boolean>('hideInlayHints', false),
+      hideHover:         settings.get<boolean>('hideHover', false),
+      hideCompletion:    settings.get<boolean>('hideCompletion', false),
+      hideSignatureHelp: settings.get<boolean>('hideSignatureHelp', false),
+      defaultCompileMode: settings.get<string>('defaultCompileActiveFileMode', 'UPLOAD'),
+      clearTerminal:     settings.get<boolean>('clearTerminalBeforeCommand', true)
+    },
+    outputChannel: vscode.window.createOutputChannel('JMCC Language Server'),
+    outputChannelName: 'JMCC Language Server'
+  };
 }
 
 async function download(url: string): Promise<string | null> {
@@ -859,64 +892,61 @@ async function checkAndUpdateAssets(context: vscode.ExtensionContext) {
         console.error("Failed to download completions.json");
     }
 
-    const propsExistedBefore = fs.existsSync(userPropsPath);
-    if (!propsExistedBefore) {
-        vscode.window.showInformationMessage('JMCC: Инициализация компилятора... Запуск jmcc.py');
-        const pythonCommand = os.platform() === 'win32' ? 'py' : 'python3';
+const propsExistedBefore = fs.existsSync(userPropsPath);
+if (!propsExistedBefore) {
+    vscode.window.showInformationMessage('JMCC: Инициализация компилятора... Запуск jmcc.py');
+    const pythonCommand = os.platform() === 'win32' ? 'py' : 'python3';
 
-        try {
-            await new Promise<void>((resolve, reject) => {
-                const child = spawn(pythonCommand, [compilerPath], {
-                    cwd: compilerDir,
-                    stdio: 'pipe',
-                    shell: false
-                });
-
-                let stderrData = '';
-                let stdoutData = '';
-
-                child.stderr?.on('data', data => stderrData += data.toString());
-                child.stdout?.on('data', data => stdoutData += data.toString());
-
-                child.on('close', async (code) => {
-                    const exists = fs.existsSync(userPropsPath) || await waitForFile(userPropsPath);
-                    if (!exists) {
-                        fs.writeFileSync(
-                            userPropsPath,
-                            `# Auto-generated by JMCC extension\n`,
-                            'utf8'
-                        );
-                    }
-
-                    if (exists) {
-                        let content = fs.readFileSync(userPropsPath, 'utf8');
-                        let lines = content.split(/\r?\n/);
-                        lines = upsertProp(lines, 'auto_update', 'True');
-                        lines = upsertProp(lines, 'check_beta_versions', 'True');
-                        lines = upsertProp(lines, 'data_version', remoteDataVersion);
-                        fs.writeFileSync(userPropsPath, lines.join('\n'), 'utf8');
-                        vscode.window.showInformationMessage('JMCC: Компилятор успешно инициализирован и настроен.');
-                    }
-
-                    if (code === 0) {
-                        console.log('jmcc.py executed successfully.');
-                        console.log('stdout:', stdoutData);
-                        resolve();
-                    } else {
-                        console.error(`jmcc.py failed with code ${code}`);
-                        console.error('stderr:', stderrData);
-                        reject(new Error(`jmcc.py failed with code ${code}`));
-                    }
-                });
-
-                child.on('error', err => {
-                    console.error('Spawn error:', err);
-                    reject(err);
-                });
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const child = spawn(pythonCommand, [compilerPath], {
+                cwd: compilerDir,
+                stdio: 'pipe',
+                shell: false
             });
-        } catch (err) {
-        }
+
+            let stderrData = '';
+            let stdoutData = '';
+
+            child.stderr?.on('data', data => stderrData += data.toString());
+            child.stdout?.on('data', data => stdoutData += data.toString());
+
+            child.on('close', async (code) => {
+                const exists = fs.existsSync(userPropsPath) || await waitForFile(userPropsPath);
+                
+                if (exists) {
+                    let content = fs.readFileSync(userPropsPath, 'utf8');
+                    let lines = content.split(/\r?\n/);
+                    lines = upsertProp(lines, 'auto_update', 'True');
+                    lines = upsertProp(lines, 'check_beta_versions', 'True');
+                    lines = upsertProp(lines, 'data_version', remoteDataVersion);
+                    fs.writeFileSync(userPropsPath, lines.join('\n'), 'utf8');
+                    vscode.window.showInformationMessage('JMCC: Компилятор успешно инициализирован и настроен.');
+                } else {
+                    return;
+                }
+
+                if (code === 0) {
+                    console.log('jmcc.py executed successfully.');
+                    console.log('stdout:', stdoutData);
+                    resolve();
+                } else {
+                    console.error(`jmcc.py failed with code ${code}`);
+                    console.error('stderr:', stderrData);
+                    reject(new Error(`jmcc.py failed with code ${code}`));
+                }
+            });
+
+            child.on('error', err => {
+                console.error('Spawn error:', err);
+                reject(err);
+            });
+        });
+    } catch (err) {
+        console.error('Error during jmcc.py execution:', err);
+        vscode.window.showErrorMessage('JMCC: Ошибка при запуске компилятора: ' + (err as Error).message);
     }
+}
 
     if (fs.existsSync(userPropsPath)) {
         const localContent = fs.readFileSync(userPropsPath, 'utf8');
@@ -960,15 +990,17 @@ export async function activate(context: vscode.ExtensionContext) {
         existingTerminal.dispose();
     }
     const commands = [
-        vscode.commands.registerCommand('jmcc.compileAsFile', (uri: vscode.Uri) => {
+        vscode.commands.registerCommand('jmcc.compileAsFile', async (uri: vscode.Uri) => {
+            await ensureDocumentSaved(uri);
             const folder = getWorkspaceFolder(uri);
             if (folder) compile(uri.fsPath, 'SAVE', folder, context, true);
         }),
-        vscode.commands.registerCommand('jmcc.compileAsUrl', (uri: vscode.Uri) => {
+        vscode.commands.registerCommand('jmcc.compileAsUrl', async (uri: vscode.Uri) => {
+            await ensureDocumentSaved(uri);
             const folder = getWorkspaceFolder(uri);
             if (folder) compile(uri.fsPath, 'UPLOAD', folder, context);
         }),
-        vscode.commands.registerCommand('jmcc.decompileFile', (uri: vscode.Uri) => {
+        vscode.commands.registerCommand('jmcc.decompileFile', async (uri: vscode.Uri) => {
             const folder = getWorkspaceFolder(uri);
             if (folder) decompile(uri.fsPath, folder, context);
         }),
@@ -980,33 +1012,33 @@ export async function activate(context: vscode.ExtensionContext) {
                  vscode.window.showWarningMessage("Please save the file first.");
                  return;
             }
-            if (document.isDirty) await document.save();
+            await ensureDocumentSaved(document.uri);
             const folder = getWorkspaceFolder(document.uri);
             if (folder && document.fileName.endsWith('.jc')) {
                 compile(document.fileName, 'SAVE', folder, context);
             }
         }),
-        vscode.commands.registerCommand('jmcc.runActiveFile', async () => {
-            const activeEditor = vscode.window.activeTextEditor;
-            if (!activeEditor) return;
-            const document = activeEditor.document;
-            if (document.isUntitled) {
-                 vscode.window.showWarningMessage("Please save the file first.");
-                 return;
-            }
-            if (document.isDirty) await document.save();
-            const filePath = document.fileName;
-            const folder = getWorkspaceFolder(document.uri);
-            if (!folder) return;
+vscode.commands.registerCommand('jmcc.runActiveFile', async () => {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return;
 
-            const config = loadOrInitConfig(folder);
-            if (filePath.endsWith('.jc')) {
-                const mode = config.defaultCompileActiveFileMode?.toUpperCase() || 'UPLOAD';
-                compile(filePath, mode, folder, context);
-            } else if (filePath.endsWith('.json')) {
-                decompile(filePath, folder, context);
-            }
-        }),
+  const doc = editor.document;
+  if (doc.isUntitled) {
+    vscode.window.showWarningMessage('Please save the file first.');
+    return;
+  }
+  await ensureDocumentSaved(doc.uri);
+  const filePath = doc.fileName;
+  const folder = getWorkspaceFolder(doc.uri);
+  if (!folder) return;
+
+  if (filePath.endsWith('.jc')) {
+    const mode = getDefaultCompileMode();
+    compile(filePath, mode, folder, context);
+  } else if (filePath.endsWith('.json')) {
+    decompile(filePath, folder, context);
+  }
+}),
         vscode.commands.registerCommand('jmcc.compileObfuscateFile', (uri: vscode.Uri) => {
             const folder = getWorkspaceFolder(uri);
             if (folder) compileWithObfuscation(uri.fsPath, 'FILE', folder, context);
