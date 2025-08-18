@@ -71,21 +71,24 @@ function getSettings(): vscode.WorkspaceConfiguration {
 
 function getConfigPath(workspaceFolder: vscode.WorkspaceFolder): string {
     const configDir = path.join(workspaceFolder.uri.fsPath, '.vscode');
-    if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-    }
     return path.join(configDir, CONFIG_FILE_NAME);
 }
 
 function loadOrInitConfig(workspaceFolder: vscode.WorkspaceFolder): JMCCConfig {
   const configPath = getConfigPath(workspaceFolder);
+  const configDir = path.dirname(configPath);
+  const autoCreateConfig = getSettings().get<boolean>('autoCreateConfig', true);
+
   const defaultConfig: JMCCConfig = {
     compilerPath: '',
     compilerOutputPath: ''
   };
-  const autoCreateConfig = getSettings().get<boolean>('autoCreateConfig', true);
+
   if (!fs.existsSync(configPath)) {
     if (autoCreateConfig) {
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
       fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf-8');
     }
     return defaultConfig;
@@ -99,6 +102,7 @@ function loadOrInitConfig(workspaceFolder: vscode.WorkspaceFolder): JMCCConfig {
     );
     throw err;
   }
+
   let modified = false;
   if (typeof config.compilerPath !== 'string') {
     config.compilerPath = '';
@@ -108,6 +112,7 @@ function loadOrInitConfig(workspaceFolder: vscode.WorkspaceFolder): JMCCConfig {
     config.compilerOutputPath = '';
     modified = true;
   }
+
   if (modified && autoCreateConfig) {
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
   }
@@ -990,16 +995,27 @@ export async function activate(context: vscode.ExtensionContext) {
         existingTerminal.dispose();
     }
     const commands = [
-        vscode.commands.registerCommand('jmcc.compileAsFile', async (uri: vscode.Uri) => {
-            await ensureDocumentSaved(uri);
-            const folder = getWorkspaceFolder(uri);
-            if (folder) compile(uri.fsPath, 'SAVE', folder, context, true);
-        }),
-        vscode.commands.registerCommand('jmcc.compileAsUrl', async (uri: vscode.Uri) => {
-            await ensureDocumentSaved(uri);
-            const folder = getWorkspaceFolder(uri);
-            if (folder) compile(uri.fsPath, 'UPLOAD', folder, context);
-        }),
+    vscode.commands.registerCommand('jmcc.compileAsUrl', async (uri: vscode.Uri) => {
+    const folder = getWorkspaceFolder(uri);
+    if (!folder) return;
+
+    const isDir = fs.statSync(uri.fsPath).isDirectory();
+    if (!isDir) {
+        await ensureDocumentSaved(uri);
+    }
+    compile(uri.fsPath, 'UPLOAD', folder, context);
+    }),
+
+    vscode.commands.registerCommand('jmcc.compileAsFile', async (uri: vscode.Uri) => {
+    const folder = getWorkspaceFolder(uri);
+    if (!folder) return;
+
+    const isDir = fs.statSync(uri.fsPath).isDirectory();
+    if (!isDir) {
+        await ensureDocumentSaved(uri);
+    }
+    compile(uri.fsPath, 'SAVE', folder, context, true);
+    }),
         vscode.commands.registerCommand('jmcc.decompileFile', async (uri: vscode.Uri) => {
             const folder = getWorkspaceFolder(uri);
             if (folder) decompile(uri.fsPath, folder, context);
@@ -1018,27 +1034,27 @@ export async function activate(context: vscode.ExtensionContext) {
                 compile(document.fileName, 'SAVE', folder, context);
             }
         }),
-vscode.commands.registerCommand('jmcc.runActiveFile', async () => {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) return;
+        vscode.commands.registerCommand('jmcc.runActiveFile', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) return;
 
-  const doc = editor.document;
-  if (doc.isUntitled) {
-    vscode.window.showWarningMessage('Please save the file first.');
-    return;
-  }
-  await ensureDocumentSaved(doc.uri);
-  const filePath = doc.fileName;
-  const folder = getWorkspaceFolder(doc.uri);
-  if (!folder) return;
+        const doc = editor.document;
+        if (doc.isUntitled) {
+            vscode.window.showWarningMessage('Please save the file first.');
+            return;
+        }
+        await ensureDocumentSaved(doc.uri);
+        const filePath = doc.fileName;
+        const folder = getWorkspaceFolder(doc.uri);
+        if (!folder) return;
 
-  if (filePath.endsWith('.jc')) {
-    const mode = getDefaultCompileMode();
-    compile(filePath, mode, folder, context);
-  } else if (filePath.endsWith('.json')) {
-    decompile(filePath, folder, context);
-  }
-}),
+        if (filePath.endsWith('.jc')) {
+            const mode = getDefaultCompileMode();
+            compile(filePath, mode, folder, context);
+        } else if (filePath.endsWith('.json')) {
+            decompile(filePath, folder, context);
+        }
+        }),
         vscode.commands.registerCommand('jmcc.compileObfuscateFile', (uri: vscode.Uri) => {
             const folder = getWorkspaceFolder(uri);
             if (folder) compileWithObfuscation(uri.fsPath, 'FILE', folder, context);

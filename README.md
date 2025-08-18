@@ -96,6 +96,7 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 | jmcc-helper.compilerOutputPath                | string                                | ""                    | Путь для сохранения скомпилированных/декомпилированных файлов |
 | jmcc-helper.autoCreateConfig                  | boolean                               | true                  | Автоматически создавать `.jmccconfig.json` в папке `.vscode` |
 
+Пути для компилятора в конфиге приоритетнее, чем в настройках.
 ## Разработка
 
 Для участия в разработке или локальной сборки расширения:
