@@ -578,275 +578,203 @@ def handle_signature_help(msg):
 def handle_inlay_hints(msg):
     rpc_id = msg["id"]
     uri = msg["params"]["textDocument"]["uri"]
+
     if HIDE_INLAY_HINTS:
         send_message({"id": rpc_id, "result": []})
         return
+
     state = ensure_tokens(uri)
     if not state["inlay_dirty"]:
         send_message({"id": rpc_id, "result": state["inlay_hints"]})
         return
+
     tokens = state["tokens"]
     offsets = state["line_offsets"]
     lines = state["text"].splitlines()
     hints = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        func = None
-        open_idx = None
+    idx = 0
+
+    def load_signature(func_name: str, is_method: bool = False) -> list[str]:
+        item = symbol_index.get(func_name) or (symbol_index.get("." + func_name) if not func_name.startswith(".") else None)
+        if item and "signature" in item:
+            return [p["label"].split(":")[0].strip() for p in item["signature"]["parameters"]]
+        if (is_method and "." in func_name) or (not is_method and "::" in func_name):
+            sep = "." if is_method else "::"
+            bare = func_name.split(sep, 1)[1]
+            item2 = symbol_index.get(bare) or (symbol_index.get("." + bare) if not bare.startswith(".") else None)
+            if item2 and "signature" in item2:
+                return [p["label"].split(":")[0].strip() for p in item2["signature"]["parameters"]]
+        sig_def = get_signature_from_definition(uri, func_name)
+        if not sig_def:
+            if is_method and "." in func_name:
+                sig_def = get_signature_from_definition(uri, func_name.split(".",1)[1])
+            elif not is_method and "::" in func_name:
+                sig_def = get_signature_from_definition(uri, func_name.split("::",1)[1])
+        return sig_def.get("params", []) if sig_def else []
+    def is_definition_header(pos: int) -> bool:
+        j = pos - 1
+        while j >= 0 and tokens[j].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON, Tokens.COLON):
+            j -= 1
+        return j >= 0 and tokens[j].type in (
+            Tokens.FUNCTION_DEFINE, Tokens.PROCESS_DEFINE, Tokens.CLASS_DEFINE
+        )
+
+    while idx < len(tokens):
+        t = tokens[idx]
+        func_name = None
+        open_paren = None
         static_call = False
         method_call = False
-        orig_method_call = False
-        block_vars = 0
-        drop_first = False
-        if tok.type == Tokens.VARIABLE and i + 1 < len(tokens) and tokens[i + 1].type == Tokens.LPAREN:
-            func, open_idx = tok.value, i + 1
-        elif tok.type == Tokens.VARIABLE and i + 3 < len(tokens) \
-             and tokens[i + 1].type == Tokens.DOUBLE_COLON \
-             and tokens[i + 2].type == Tokens.VARIABLE \
-             and tokens[i + 3].type == Tokens.LPAREN:
-            func = f"{tok.value}::{tokens[i + 2].value}"
-            open_idx = i + 3
+        if (
+            t.type == Tokens.VARIABLE and
+            idx + 1 < len(tokens) and tokens[idx+1].type == Tokens.LPAREN and
+            not is_definition_header(idx)
+        ):
+            func_name = t.value
+            open_paren = idx + 1
+        elif (
+            t.type == Tokens.VARIABLE and
+            idx + 1 < len(tokens) and tokens[idx+1].type == Tokens.DOUBLE_COLON and
+            idx + 2 < len(tokens) and tokens[idx+2].type == Tokens.VARIABLE and
+            idx + 3 < len(tokens) and tokens[idx+3].type == Tokens.LPAREN and
+            not is_definition_header(idx)
+        ):
+            func_name = f"{t.value}::{tokens[idx+2].value}"
+            open_paren = idx + 3
             static_call = True
-        elif tok.type == Tokens.VARIABLE and i + 3 < len(tokens) \
-             and tokens[i + 1].type == Tokens.DOT \
-             and tokens[i + 2].type == Tokens.VARIABLE \
-             and tokens[i + 3].type == Tokens.LPAREN:
-            raw_method = tokens[i + 2].value
-            func = f"{tok.value}.{raw_method}"
-            open_idx = i + 3
-            method_call = True
-            orig_method_call = True
-        if open_idx is None:
-            i += 1
+        elif t.type == Tokens.VARIABLE:
+            j = idx+1
+            parts = [t.value]
+            while j+1 < len(tokens) and tokens[j].type == Tokens.DOT and tokens[j+1].type == Tokens.VARIABLE:
+                parts.append(tokens[j+1].value)
+                j += 2
+            if len(parts) > 1 and j < len(tokens) and tokens[j].type == Tokens.LPAREN and not is_definition_header(idx):
+                func_name = ".".join(parts)
+                open_paren = j
+                method_call = True
+
+        if open_paren is None:
+            idx += 1
             continue
-        if method_call and func not in symbol_index:
-            for full_name in symbol_index:
-                if full_name.split("::")[-1] == raw_method:
-                    func = full_name
-                    static_call = True
-                    method_call = False
-                    break
         depth = 0
-        close = None
-        for j in range(open_idx, len(tokens)):
-            t = tokens[j]
-            if t.type in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
+        close_paren = None
+        for j in range(open_paren, len(tokens)):
+            tp = tokens[j].type
+            if tp in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
                 depth += 1
-            elif t.type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
+            elif tp in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
                 depth -= 1
                 if depth == 0:
-                    close = j
+                    close_paren = j
                     break
-        if close is None:
-            i = open_idx + 1
+        if close_paren is None:
+            idx = open_paren + 1
             continue
-        sl, sc = pos_to_line_col(tokens[open_idx].starting_pos, offsets)
-        prefix = lines[sl][:sc]
-        sig = parse_function_signature(lines[sl])
-        if sig and sig["name"] == func:
-            i = close + 1
+
+        sig_params = load_signature(func_name, is_method=method_call)
+        if not sig_params:
+            idx = close_paren + 1
             continue
-        args = tokens[open_idx + 1 : close]
+
+        args = tokens[open_paren+1 : close_paren]
         if not args:
-            i = close + 1
+            idx = close_paren + 1
             continue
-        params = []
-        if func in symbol_index and "signature" in symbol_index[func]:
-            sig_data = symbol_index[func]["signature"]
-            params = [
-                p["label"].split(":")[0].strip()
-                for p in sig_data.get("parameters", [])
-            ]
-        else:
-            sig_def = get_signature_from_definition(uri, func)
-            if sig_def:
-                params = sig_def["params"]
-        is_repeat_function = func.startswith("repeat::")
-        repeat_block_offset = 0
-        
-        if is_repeat_function:
-            j = close + 1
-            while j < len(tokens) and tokens[j].type != Tokens.LCPAREN:
-                j += 1
-            
-            if j < len(tokens) and tokens[j].type == Tokens.LCPAREN:
-                block_start = j
+        offset = 0
+        if func_name.startswith("repeat::"):
+            block_start = None
+            for k in range(close_paren+1, len(tokens)):
+                if tokens[k].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
+                    continue
+                if tokens[k].type == Tokens.LCPAREN:
+                    block_start = k
+                break
+            if block_start is not None:
+                bd = 1
                 block_end = None
-                block_depth = 0
-                
-                for k in range(j, len(tokens)):
+                for k in range(block_start+1, len(tokens)):
                     if tokens[k].type == Tokens.LCPAREN:
-                        block_depth += 1
+                        bd += 1
                     elif tokens[k].type == Tokens.RCPAREN:
-                        block_depth -= 1
-                        if block_depth == 0:
+                        bd -= 1
+                        if bd == 0:
                             block_end = k
                             break
-                
-                if block_end:
-                    for k in range(block_start, block_end):
-                        if tokens[k].type == Tokens.CYCLE_THING:
-                            vars_before_arrow = 0
-                            for l in range(block_start + 1, k):
-                                if tokens[l].type == Tokens.VARIABLE:
-                                    vars_before_arrow += 1
-                                elif tokens[l].type == Tokens.COMMA:
-                                    vars_before_arrow += 1
-                            
-                            if func == "repeat::for_each_in_list":
-                                repeat_block_offset = max(0, vars_before_arrow - 2)
-                            else:
-                                repeat_block_offset = max(0, vars_before_arrow - 1)
+                if block_end is not None:
+                    vc = 0
+                    for tt in tokens[block_start+1:block_end]:
+                        if tt.type == Tokens.CYCLE_THING:
                             break
-        
-        is_multiple_assignment = False
-        assigned_variable_count = 0
-        temp_search = i - 1
-        while temp_search >= 0:
-            if tokens[temp_search].type == Tokens.ASSIGN:
-                var_count = 0
-                temp_var_search = temp_search - 1
-                while temp_var_search >= 0:
-                    t2 = tokens[temp_var_search]
-                    if t2.type == Tokens.COMMA:
-                        pass
-                    elif t2.type == Tokens.VARIABLE:
-                        var_count += 1
-                    elif t2.type in (
-                        Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN,
-                        Tokens.NEXT_LINE, Tokens.SEMICOLON
-                    ):
-                        break
-                    temp_var_search -= 1
-                if var_count > 0:
-                    is_multiple_assignment = True
-                    assigned_variable_count = var_count
-                break
-            if tokens[temp_search].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
-                break
-            temp_search -= 1
-        has_return = False
-        temp_check = i - 1
-        while temp_check >= 0:
-            if tokens[temp_check].type == Tokens.RETURN:
-                has_return = True
-                break
-            if tokens[temp_check].type in (Tokens.NEXT_LINE, Tokens.SEMICOLON):
-                break
-            temp_check -= 1
-        if orig_method_call or (static_call and '=' in prefix):
-            drop_first = True
-        if is_repeat_function:
-            j = close + 1
-            found_block = False
-            while j < len(tokens):
-                if tokens[j].type == Tokens.LCPAREN:
-                    block_start = j
-                    block_depth = 0
-                    block_end = None
-                    for k in range(j, len(tokens)):
-                        if tokens[k].type == Tokens.LCPAREN:
-                            block_depth += 1
-                        elif tokens[k].type == Tokens.RCPAREN:
-                            block_depth -= 1
-                            if block_depth == 0:
-                                block_end = k
-                                break
-                    
-                    if block_end:
-                        for k in range(block_start, block_end):
-                            if tokens[k].type == Tokens.CYCLE_THING:
-                                found_block = True
-                                break
+                        if tt.type == Tokens.VARIABLE:
+                            vc += 1
+                    offset = vc
+        elif static_call or method_call:
+            assign_idx = None
+            return_found = False
+            for j in range(idx-1, -1, -1):
+                prev = tokens[j]
+                if prev.type in (Tokens.SEMICOLON, Tokens.NEXT_LINE):
                     break
-                elif tokens[j].type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN, Tokens.NEXT_LINE, Tokens.SEMICOLON):
+                if prev.type == Tokens.ASSIGN:
+                    assign_idx = j
                     break
-                j += 1
-            if found_block:
-                drop_first = True
-            else:
-                drop_first = False
-        if is_multiple_assignment and params:
-            has_named = any(t.type == Tokens.ASSIGN for t in args)
-            if has_named:
-                named = set()
-                for k, t3 in enumerate(args):
-                    if t3.type == Tokens.ASSIGN and k > 0 and args[k-1].type == Tokens.VARIABLE:
-                        named.add(args[k-1].value)
-                remaining = [p for p in params if p not in named]
-                params = [remaining[-1]] if remaining else []
-            else:
-                if assigned_variable_count > 0 and len(params) > assigned_variable_count:
-                    params = params[assigned_variable_count:]
-        else:
-            if drop_first and params:
-                if len(params) > 1:
-                    params = params[1:]
-            if block_vars > 0:
-                params = params[block_vars:]
-        if has_return and params:
-            if len(params) > 1:
-                params = params[1:]
-        if is_repeat_function and repeat_block_offset > 0:
-            if len(params) > repeat_block_offset:
-                params = params[repeat_block_offset:]
-            else:
-                params = []
-        if not params:
-            i = close + 1
+                if prev.type == Tokens.RETURN:
+                    return_found = True
+                    break
+            if assign_idx is not None and not (method_call and len(sig_params) == 1):
+                vc = 0
+                k = assign_idx - 1
+                while k >= 0 and tokens[k].type in (Tokens.VARIABLE, Tokens.COMMA):
+                    if tokens[k].type == Tokens.VARIABLE:
+                        vc += 1
+                    k -= 1
+                offset = vc
+            elif return_found and not (method_call and len(sig_params) == 1):
+                offset = 1
+        active = sig_params[offset:]
+        if not active:
+            idx = close_paren + 1
             continue
-        def split_top(lst):
-            out, cur, lvl = [], [], 0
-            for t4 in lst:
-                if t4.type in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
+        def split_top(ts):
+            groups, cur, lvl = [], [], 0
+            for tt in ts:
+                if tt.type in (Tokens.LPAREN, Tokens.LSPAREN, Tokens.LCPAREN):
                     lvl += 1
-                elif t4.type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
+                elif tt.type in (Tokens.RPAREN, Tokens.RSPAREN, Tokens.RCPAREN):
                     lvl -= 1
-                if t4.type == Tokens.COMMA and lvl == 0:
-                    out.append(cur)
+                if tt.type == Tokens.COMMA and lvl == 0:
+                    groups.append(cur)
                     cur = []
                 else:
-                    cur.append(t4)
+                    cur.append(tt)
             if cur:
-                out.append(cur)
-            return out
+                groups.append(cur)
+            return groups
+
         groups = split_top(args)
-        used_named = set()
         pidx = 0
         for grp in groups:
-            if not grp:
-                continue
-            if any(t.type == Tokens.ASSIGN for t in grp):
-                name = next((t.value for t in grp if t.type == Tokens.VARIABLE), None)
-                if name:
-                    used_named.add(name)
-                continue
-            while pidx < len(params) and params[pidx] in used_named:
-                pidx += 1
-            if pidx >= len(params):
+            if pidx >= len(active):
                 break
-            first_token = None
-            for t5 in grp:
-                if t5.type != Tokens.NEXT_LINE:
-                    first_token = t5
-                    break
-            if first_token is None:
+            first_tok = next((x for x in grp if x.type != Tokens.NEXT_LINE), None)
+            if not first_tok:
                 continue
-            ln, ch = pos_to_line_col(first_token.starting_pos, offsets)
-            hint = {
+            ln, ch = pos_to_line_col(first_tok.starting_pos, offsets)
+            hints.append({
                 "position": {"line": ln, "character": ch},
-                "label": params[pidx] + ":",
+                "label": active[pidx] + ":",
                 "kind": 1,
                 "paddingLeft": False,
                 "paddingRight": True
-            }
-            hints.append(hint)
+            })
             pidx += 1
-        i = close + 1
+
+        idx = close_paren + 1
+
     state["inlay_hints"] = hints
     state["inlay_dirty"] = False
     send_message({"id": rpc_id, "result": hints})
+
 
 def main():
     log("Server starting")
