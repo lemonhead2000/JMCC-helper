@@ -752,13 +752,26 @@ def handle_inlay_hints(msg):
             return groups
 
         groups = split_top(args)
+        named = set()
+        for grp in groups:
+            for i2, tok2 in enumerate(grp):
+                if tok2.type == Tokens.ASSIGN and i2 > 0 and grp[i2-1].type == Tokens.VARIABLE:
+                    named.add(grp[i2-1].value)
+        active = [p for p in active if p not in named]
+        if not active:
+            idx = close_paren + 1
+            continue
         pidx = 0
         for grp in groups:
+            if any(tt.type == Tokens.ASSIGN for tt in grp):
+                continue
+
             if pidx >= len(active):
                 break
             first_tok = next((x for x in grp if x.type != Tokens.NEXT_LINE), None)
             if not first_tok:
                 continue
+
             ln, ch = pos_to_line_col(first_tok.starting_pos, offsets)
             hints.append({
                 "position": {"line": ln, "character": ch},
