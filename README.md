@@ -94,7 +94,11 @@ compilation/decompilation, syntax highlighting, and functions based on the Langu
 | jmcc-helper.clearTerminalBeforeCommand        | boolean                               | true                  | Очищать терминал перед выполнением каждой команды          |
 | jmcc-helper.compilerPath                      | string                                | ""                    | Путь к исполняемому JMCC  |
 | jmcc-helper.compilerOutputPath                | string                                | ""                    | Путь для сохранения скомпилированных/декомпилированных файлов |
-| jmcc-helper.autoCreateConfig                  | boolean                               | true                  | Автоматически создавать `.jmccconfig.json` в папке `.vscode` |
+| jmcc-helper.autoCreateConfig                  | boolean                               | false                 | Автоматически создавать `.jmccconfig.json` в папке `.vscode` |
+| jmcc-helper.autoUpdate                        | boolean                               | true                  | Включить автообновление компилятора и ассетов             |
+| jmcc-helper.checkBetaVersions                 | boolean                               | false                 | Проверять бета-версии при автообновлении                  |
+| jmcc-helper.remotePropsUrl                    | string                                | Оригинальный URL    | Кастомный URL для загрузки `jmcc.properties`              |
+| jmcc-helper.remoteCompilerUrl                 | string                                | Оригинальный URL    | Кастомный URL для загрузки `jmcc.py`                     |
 
 Пути для компилятора в конфиге приоритетнее, чем в настройках.
 ## Разработка
