@@ -508,137 +508,43 @@ import re
 
 _symbol_completion_cache: Dict[str, Tuple[List[Dict[str, Any]], int]] = {}
 
-def handle_completion(msg: dict) -> None:
-    try:
-        rpc_id = msg.get("id")
-        if HIDE_COMPLETION:
-            send_message({"id": rpc_id, "result": {"isIncomplete": False, "items": []}})
-            return
+def handle_completion(msg):
+    rpc_id = msg["id"]
+    uri = msg["params"]["textDocument"]["uri"]
+    if HIDE_COMPLETION:
+        send_message({"id": rpc_id, "result": []})
+        return
+    pos = msg["params"]["position"]
+    state = document_states.get(uri)
+    if not state:
+        send_message({"id": rpc_id, "result": {"isIncomplete":False,"items":[]}})
+        return
 
-        uri = msg["params"]["textDocument"]["uri"]
-        pos = msg["params"]["position"]
-        st = document_states.get(uri)
-        if not st:
-            send_message({"id": rpc_id, "result": {"isIncomplete": False, "items": []}})
-            return
+    lines = state["text"].splitlines()
+    if pos["line"] >= len(lines):
+        send_message({"id": rpc_id, "result": {"isIncomplete":False,"items":[]}})
+        return
 
-        lines = st["text"].splitlines()
-        if not (0 <= pos["line"] < len(lines)):
-            send_message({"id": rpc_id, "result": {"isIncomplete": False, "items": []}})
-            return
+    line = lines[pos["line"]]
+    prefix = re.search(r"[\w:<]*$", line[:pos["character"]]).group(0)
+    items = get_completions(prefix)
 
-        line   = lines[pos["line"]]
-        before = line[:pos["character"]]
+    edits = []
+    for it in items:
+        lbl = it.get("insertText", it["label"])
+        start_ch = max(0, pos["character"] - len(prefix))
+        edits.append({
+            **it,
+            "textEdit": {
+                "range": {
+                    "start": {"line":pos["line"],"character":start_ch},
+                    "end":   {"line":pos["line"],"character":pos["character"]}
+                },
+                "newText": lbl
+            }
+        })
 
-        
-        ctx = msg["params"].get("context", {})
-        trigger_kind = ctx.get("triggerKind", 1)
-        is_invoke = (trigger_kind == 2)
-
-        
-        text_hash = hash(st["text"])
-        cache = _symbol_completion_cache.get(uri)
-        if cache and cache[1] == text_hash:
-            user_items = cache[0]
-        else:
-            syms = _load_document_symbols(uri)   
-            user_items = [
-                {"label": name, "kind": 6, "filterText": name}
-                for name in syms.keys()
-            ]
-            _symbol_completion_cache[uri] = (user_items, text_hash)
-
-        
-        m_sep = re.search(r'(?:(?P<sep>\.|::|->))(?P<seg>[\w:<]*)$', before)
-        sep_included = False
-
-        if m_sep:
-            sep        = m_sep.group("sep")
-            prefix     = m_sep.group("seg")
-            sep_start  = m_sep.start("sep")
-            sep_included = True
-            start_ch   = pos["character"] - len(prefix) - len(sep)
-
-            
-            dynamic: List[Dict[str, Any]] = []
-            if sep == ".":
-                pre = before[:sep_start]
-                m_obj = re.search(r'([\w_]\w*)\s*$', pre)
-                obj_name = m_obj.group(1) if m_obj else None
-
-                if obj_name:
-                    assign = re.search(
-                        fr'\b{re.escape(obj_name)}\s*=\s*([A-Za-z_]\w*)\s*\(',
-                        st["text"]
-                    )
-                    type_name = assign.group(1) if assign else None
-                    if type_name:
-                        
-                        idx = file_class_index.get(uri, {})
-                        if idx.get("_text_hash") != text_hash:
-                            update_class_index(uri, st["text"])
-                            file_class_index[uri]["_text_hash"] = text_hash
-
-                        methods = file_class_index.get(uri, {}).get(type_name, [])
-                        for m in methods:
-                            if not m.startswith("__") and m.startswith(prefix):
-                                dynamic.append({
-                                    "label": m,
-                                    "kind": 5,
-                                    "filterText": m
-                                })
-
-            
-            items = dynamic + user_items + get_completions(prefix)
-
-        else:
-            
-            m = re.search(r"[\w:<]*$", before)
-            prefix   = m.group(0) if m else ""
-            start_ch = pos["character"] - len(prefix)
-            sep       = ""
-            items = user_items + get_completions(prefix)
-
-        
-        seen: Set[str] = set()
-        filtered: List[Dict[str, Any]] = []
-        for it in items:
-            lbl = it.get("label", "")
-            ok_prefix = lbl.lower().startswith(prefix.lower()) or is_invoke
-            if ok_prefix and lbl not in seen:
-                seen.add(lbl)
-                filtered.append(it)
-        items = filtered
-
-        
-        results: List[Dict[str, Any]] = []
-        start_ch = max(0, start_ch)
-        for it in items:
-            lbl = it["label"]
-            new_text = lbl
-
-            if sep_included and not lbl.startswith(sep):
-                new_text = sep + lbl
-                filt = it.get("filterText", lbl)
-                if not filt.startswith(sep):
-                    it["filterText"] = sep + filt
-
-            results.append({
-                **it,
-                "textEdit": {
-                    "range": {
-                        "start": {"line": pos["line"], "character": start_ch},
-                        "end":   {"line": pos["line"], "character": pos["character"]},
-                    },
-                    "newText": new_text
-                }
-            })
-
-        send_message({"id": rpc_id, "result": {"isIncomplete": False, "items": results}})
-
-    except Exception as e:
-        log.error(f"completion error: {e}")
-        send_message({"id": msg.get("id"), "result": {"isIncomplete": False, "items": []}})
+    send_message({"id":rpc_id,"result":{"isIncomplete":False,"items":edits}})
 
 def _load_document_symbols(uri: str) -> Dict[str, Any]:
     st = ensure_tokens(uri)
@@ -646,44 +552,6 @@ def _load_document_symbols(uri: str) -> Dict[str, Any]:
         build_definitions(uri)
     return st["definitions"]
 
-def extract_call_args(tokens: List[Any], text: str, idx: int) -> List[str]:
-    args_text = ""
-    depth = 0
-    
-    for j in range(idx, len(tokens)):
-        t = tokens[j]
-        if t.type == Tokens.LPAREN:
-            depth = 1
-            k = j + 1
-            
-            while k < len(tokens) and depth > 0:
-                tk = tokens[k]
-                if tk.type == Tokens.LPAREN:
-                    depth += 1
-                elif tk.type == Tokens.RPAREN:
-                    depth -= 1
-                    if depth == 0:
-                        break
-                k += 1
-            start_pos = t.starting_pos + 1
-            end_pos = tokens[k].starting_pos
-            args_text = text[start_pos:end_pos]
-            break
-
-    parts, cur, lvl = [], "", 0
-    for ch in args_text:
-        if ch == "(":
-            lvl += 1
-        elif ch == ")":
-            lvl -= 1
-        if ch == "," and lvl == 0:
-            parts.append(cur.strip())
-            cur = ""
-        else:
-            cur += ch
-    if cur.strip():
-        parts.append(cur.strip())
-    return parts
 
 def get_class_method_signatures(text: str, class_name: str, method_name: str) -> List[str]:
     sigs, in_cls, depth = [], False, 0
